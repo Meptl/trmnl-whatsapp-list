@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
-fn main() {
-    println!("Hello, world!");
+mod config;
+
+fn main() -> Result<(), config::ConfigError> {
+    let _config = config::AppConfig::from_env()?;
+    Ok(())
 }
 
 #[cfg(test)]
