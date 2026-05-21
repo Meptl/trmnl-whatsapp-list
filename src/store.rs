@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
 
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 const CREATE_ENTRIES_TABLE: &str = "\
     CREATE TABLE IF NOT EXISTS entries (
@@ -43,6 +43,13 @@ impl Entry {
     pub fn created_at(&self) -> &str {
         &self.created_at
     }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RemoveEntryResult {
+    Removed(Entry),
+    NotFound,
 }
 
 #[derive(Clone)]
@@ -98,6 +105,30 @@ impl StoreHandle {
         Ok(entries)
     }
 
+    #[allow(dead_code)]
+    pub fn remove_entry_by_text(&self, text: &str) -> Result<RemoveEntryResult, StoreError> {
+        let connection = self.open_connection()?;
+        let exact_entry = find_exact_entry_by_text(&connection, text)?;
+        let entry = match exact_entry {
+            Some(entry) => Some(entry),
+            None => find_case_insensitive_entry_by_text(&connection, text)?,
+        };
+
+        match entry {
+            Some(entry) => {
+                let deleted_count =
+                    connection.execute("DELETE FROM entries WHERE id = ?1", [entry.id()])?;
+
+                if deleted_count == 0 {
+                    Ok(RemoveEntryResult::NotFound)
+                } else {
+                    Ok(RemoveEntryResult::Removed(entry))
+                }
+            }
+            None => Ok(RemoveEntryResult::NotFound),
+        }
+    }
+
     fn open_connection(&self) -> Result<Connection, StoreError> {
         Ok(Connection::open(&self.database_path)?)
     }
@@ -115,6 +146,42 @@ fn entry_from_row(row: &Row<'_>) -> rusqlite::Result<Entry> {
         row.get::<_, String>(1)?,
         row.get::<_, String>(2)?,
     ))
+}
+
+fn find_exact_entry_by_text(
+    connection: &Connection,
+    text: &str,
+) -> Result<Option<Entry>, StoreError> {
+    Ok(connection
+        .query_row(
+            &format!(
+                "SELECT id, text, created_at FROM entries \
+                 WHERE text = ?1 \
+                 ORDER BY {ENTRIES_CREATION_ORDER_SQL} \
+                 LIMIT 1"
+            ),
+            [text],
+            entry_from_row,
+        )
+        .optional()?)
+}
+
+fn find_case_insensitive_entry_by_text(
+    connection: &Connection,
+    text: &str,
+) -> Result<Option<Entry>, StoreError> {
+    Ok(connection
+        .query_row(
+            &format!(
+                "SELECT id, text, created_at FROM entries \
+                 WHERE text = ?1 COLLATE NOCASE \
+                 ORDER BY {ENTRIES_CREATION_ORDER_SQL} \
+                 LIMIT 1"
+            ),
+            [text],
+            entry_from_row,
+        )
+        .optional()?)
 }
 
 #[derive(Debug)]
@@ -260,6 +327,100 @@ mod tests {
     }
 
     #[test]
+    fn remove_entry_by_text_prefers_exact_match_over_case_insensitive_match() {
+        let database = TestDatabase::new("remove_prefers_exact");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+        let connection = Connection::open(database.path()).expect("database should open");
+
+        insert_entry(&connection, "milk", "2026-05-21T20:24:00Z");
+        insert_entry(&connection, "Milk", "2026-05-21T20:24:01Z");
+        let exact_id = entry_id_by_text(&connection, "Milk");
+
+        let result = store
+            .remove_entry_by_text("Milk")
+            .expect("entry should remove");
+        let entries = store.list_entries().expect("entries should list");
+
+        assert_eq!(
+            result,
+            RemoveEntryResult::Removed(Entry::new(exact_id, "Milk", "2026-05-21T20:24:01Z"))
+        );
+        assert_eq!(entry_texts(&entries), ["milk"]);
+    }
+
+    #[test]
+    fn remove_entry_by_text_falls_back_to_case_insensitive_match() {
+        let database = TestDatabase::new("remove_case_insensitive");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+        let connection = Connection::open(database.path()).expect("database should open");
+
+        insert_entry(&connection, "Milk", "2026-05-21T20:24:00Z");
+        let entry_id = entry_id_by_text(&connection, "Milk");
+
+        let result = store
+            .remove_entry_by_text("milk")
+            .expect("entry should remove");
+        let entries = store.list_entries().expect("entries should list");
+
+        assert_eq!(
+            result,
+            RemoveEntryResult::Removed(Entry::new(entry_id, "Milk", "2026-05-21T20:24:00Z"))
+        );
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn remove_entry_by_text_removes_earliest_displayed_duplicate() {
+        let database = TestDatabase::new("remove_duplicate_order");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+        let connection = Connection::open(database.path()).expect("database should open");
+
+        insert_entry(&connection, "milk", "2026-05-21T20:24:01Z");
+        insert_entry(&connection, "first", "2026-05-21T20:24:00Z");
+        insert_entry(&connection, "milk", "2026-05-21T20:24:02Z");
+
+        let duplicate_ids = entry_ids_by_text(&connection, "milk");
+        let result = store
+            .remove_entry_by_text("milk")
+            .expect("entry should remove");
+        let entries = store.list_entries().expect("entries should list");
+
+        assert_eq!(
+            result,
+            RemoveEntryResult::Removed(Entry::new(
+                duplicate_ids[0],
+                "milk",
+                "2026-05-21T20:24:01Z"
+            ))
+        );
+        assert_eq!(entry_texts(&entries), ["first", "milk"]);
+        assert_eq!(entries[1].id(), duplicate_ids[1]);
+    }
+
+    #[test]
+    fn remove_entry_by_text_returns_not_found_without_changing_list() {
+        let database = TestDatabase::new("remove_not_found");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+        let connection = Connection::open(database.path()).expect("database should open");
+
+        insert_entry(&connection, "milk", "2026-05-21T20:24:00Z");
+        insert_entry(&connection, "eggs", "2026-05-21T20:24:01Z");
+        let before = store.list_entries().expect("entries should list");
+
+        let result = store
+            .remove_entry_by_text("bread")
+            .expect("not found should not error");
+        let after = store.list_entries().expect("entries should list");
+
+        assert_eq!(result, RemoveEntryResult::NotFound);
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn creation_order_sql_stabilizes_equal_timestamps_by_id() {
         let database = TestDatabase::new("creation_order");
         let store = StoreHandle::new(database.path());
@@ -336,6 +497,24 @@ mod tests {
                 row.get(0)
             })
             .expect("entry id should query by text")
+    }
+
+    fn entry_ids_by_text(connection: &Connection, text: &str) -> Vec<i64> {
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT id FROM entries WHERE text = ?1 ORDER BY {ENTRIES_CREATION_ORDER_SQL}"
+            ))
+            .expect("entry ids by text statement should prepare");
+
+        statement
+            .query_map([text], |row| row.get(0))
+            .expect("entry ids should query by text")
+            .collect::<Result<Vec<i64>, _>>()
+            .expect("entry ids should collect")
+    }
+
+    fn entry_texts(entries: &[Entry]) -> Vec<&str> {
+        entries.iter().map(Entry::text).collect()
     }
 
     fn table_columns(connection: &Connection, table_name: &str) -> Vec<String> {
