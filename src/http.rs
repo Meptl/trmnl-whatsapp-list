@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn builds_router_with_shared_state() {
-        let state = AppState::new(test_config());
+        let state = AppState::new_uninitialized(test_config());
 
         let app = router(state);
 
@@ -69,7 +69,7 @@ mod tests {
 
     #[tokio::test]
     async fn placeholder_handlers_do_not_return_success() {
-        let state = AppState::new(test_config());
+        let state = AppState::new_uninitialized(test_config());
 
         assert_eq!(
             whatsapp_verify(State(state.clone())).await,
