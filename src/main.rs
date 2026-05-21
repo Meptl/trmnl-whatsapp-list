@@ -6,6 +6,8 @@ mod commands;
 mod config;
 mod http;
 mod store;
+#[allow(dead_code)]
+mod whatsapp;
 
 use axum::Router;
 use tokio::net::TcpListener;
