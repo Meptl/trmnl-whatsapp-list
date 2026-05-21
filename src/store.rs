@@ -129,6 +129,36 @@ impl StoreHandle {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn remove_entry_by_position(
+        &self,
+        position: usize,
+    ) -> Result<RemoveEntryResult, StoreError> {
+        let Some(offset) = position.checked_sub(1) else {
+            return Ok(RemoveEntryResult::NotFound);
+        };
+        let Ok(offset) = i64::try_from(offset) else {
+            return Ok(RemoveEntryResult::NotFound);
+        };
+
+        let connection = self.open_connection()?;
+        let entry = find_entry_by_position_offset(&connection, offset)?;
+
+        match entry {
+            Some(entry) => {
+                let deleted_count =
+                    connection.execute("DELETE FROM entries WHERE id = ?1", [entry.id()])?;
+
+                if deleted_count == 0 {
+                    Ok(RemoveEntryResult::NotFound)
+                } else {
+                    Ok(RemoveEntryResult::Removed(entry))
+                }
+            }
+            None => Ok(RemoveEntryResult::NotFound),
+        }
+    }
+
     fn open_connection(&self) -> Result<Connection, StoreError> {
         Ok(Connection::open(&self.database_path)?)
     }
@@ -179,6 +209,23 @@ fn find_case_insensitive_entry_by_text(
                  LIMIT 1"
             ),
             [text],
+            entry_from_row,
+        )
+        .optional()?)
+}
+
+fn find_entry_by_position_offset(
+    connection: &Connection,
+    offset: i64,
+) -> Result<Option<Entry>, StoreError> {
+    Ok(connection
+        .query_row(
+            &format!(
+                "SELECT id, text, created_at FROM entries \
+                 ORDER BY {ENTRIES_CREATION_ORDER_SQL} \
+                 LIMIT 1 OFFSET ?1"
+            ),
+            [offset],
             entry_from_row,
         )
         .optional()?)
@@ -413,6 +460,108 @@ mod tests {
 
         let result = store
             .remove_entry_by_text("bread")
+            .expect("not found should not error");
+        let after = store.list_entries().expect("entries should list");
+
+        assert_eq!(result, RemoveEntryResult::NotFound);
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn remove_entry_by_position_one_removes_first_displayed_entry() {
+        let database = TestDatabase::new("remove_position_first");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+        let connection = Connection::open(database.path()).expect("database should open");
+
+        insert_entry(&connection, "second", "2026-05-21T20:24:01Z");
+        insert_entry(&connection, "first", "2026-05-21T20:24:00Z");
+        insert_entry(&connection, "third", "2026-05-21T20:24:02Z");
+        let first_id = entry_id_by_text(&connection, "first");
+
+        let result = store
+            .remove_entry_by_position(1)
+            .expect("entry should remove");
+        let entries = store.list_entries().expect("entries should list");
+
+        assert_eq!(
+            result,
+            RemoveEntryResult::Removed(Entry::new(first_id, "first", "2026-05-21T20:24:00Z"))
+        );
+        assert_eq!(entry_texts(&entries), ["second", "third"]);
+    }
+
+    #[test]
+    fn remove_entry_by_position_two_removes_second_displayed_entry() {
+        let database = TestDatabase::new("remove_position_second");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+        let connection = Connection::open(database.path()).expect("database should open");
+
+        insert_entry(&connection, "first", "2026-05-21T20:24:00Z");
+        insert_entry(&connection, "second", "2026-05-21T20:24:01Z");
+        insert_entry(&connection, "third", "2026-05-21T20:24:02Z");
+        let second_id = entry_id_by_text(&connection, "second");
+
+        let result = store
+            .remove_entry_by_position(2)
+            .expect("entry should remove");
+        let entries = store.list_entries().expect("entries should list");
+
+        assert_eq!(
+            result,
+            RemoveEntryResult::Removed(Entry::new(second_id, "second", "2026-05-21T20:24:01Z"))
+        );
+        assert_eq!(entry_texts(&entries), ["first", "third"]);
+    }
+
+    #[test]
+    fn remove_entry_by_position_out_of_range_returns_not_found_without_changing_list() {
+        let database = TestDatabase::new("remove_position_out_of_range");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+        let connection = Connection::open(database.path()).expect("database should open");
+
+        insert_entry(&connection, "first", "2026-05-21T20:24:00Z");
+        insert_entry(&connection, "second", "2026-05-21T20:24:01Z");
+        let before = store.list_entries().expect("entries should list");
+
+        let result = store
+            .remove_entry_by_position(3)
+            .expect("not found should not error");
+        let after = store.list_entries().expect("entries should list");
+
+        assert_eq!(result, RemoveEntryResult::NotFound);
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn remove_entry_by_position_empty_list_returns_not_found() {
+        let database = TestDatabase::new("remove_position_empty");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+
+        let result = store
+            .remove_entry_by_position(1)
+            .expect("not found should not error");
+        let entries = store.list_entries().expect("entries should list");
+
+        assert_eq!(result, RemoveEntryResult::NotFound);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn remove_entry_by_position_zero_returns_not_found_without_changing_list() {
+        let database = TestDatabase::new("remove_position_zero");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+        let connection = Connection::open(database.path()).expect("database should open");
+
+        insert_entry(&connection, "first", "2026-05-21T20:24:00Z");
+        let before = store.list_entries().expect("entries should list");
+
+        let result = store
+            .remove_entry_by_position(0)
             .expect("not found should not error");
         let after = store.list_entries().expect("entries should list");
 
