@@ -1,7 +1,8 @@
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
+use serde::Deserialize;
 
 use crate::app::AppState;
 
@@ -17,10 +18,28 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn whatsapp_verify(State(state): State<AppState>) -> StatusCode {
+#[derive(Deserialize)]
+struct WhatsAppVerifyQuery {
+    #[serde(rename = "hub.verify_token")]
+    verify_token: Option<String>,
+    #[serde(rename = "hub.challenge")]
+    challenge: Option<String>,
+}
+
+async fn whatsapp_verify(
+    State(state): State<AppState>,
+    Query(query): Query<WhatsAppVerifyQuery>,
+) -> Result<String, StatusCode> {
     acknowledge_state_shape(&state);
 
-    StatusCode::NOT_IMPLEMENTED
+    match (query.verify_token, query.challenge) {
+        (Some(verify_token), Some(challenge))
+            if verify_token == state.config.whatsapp.verify_token.as_str() =>
+        {
+            Ok(challenge)
+        }
+        _ => Err(StatusCode::FORBIDDEN),
+    }
 }
 
 async fn whatsapp_webhook(State(state): State<AppState>) -> StatusCode {
@@ -68,13 +87,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn placeholder_handlers_do_not_return_success() {
+    async fn whatsapp_verification_returns_exact_challenge_for_correct_token() {
         let state = AppState::new_uninitialized(test_config());
 
         assert_eq!(
-            whatsapp_verify(State(state.clone())).await,
-            StatusCode::NOT_IMPLEMENTED
+            whatsapp_verify(
+                State(state),
+                Query(WhatsAppVerifyQuery {
+                    verify_token: Some("verify-secret".to_owned()),
+                    challenge: Some("challenge-body".to_owned()),
+                }),
+            )
+            .await,
+            Ok("challenge-body".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn whatsapp_verification_rejects_wrong_or_missing_token() {
+        let state = AppState::new_uninitialized(test_config());
+
+        assert_eq!(
+            whatsapp_verify(
+                State(state.clone()),
+                Query(WhatsAppVerifyQuery {
+                    verify_token: Some("wrong-secret".to_owned()),
+                    challenge: Some("challenge-body".to_owned()),
+                }),
+            )
+            .await,
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            whatsapp_verify(
+                State(state),
+                Query(WhatsAppVerifyQuery {
+                    verify_token: None,
+                    challenge: Some("challenge-body".to_owned()),
+                }),
+            )
+            .await,
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[tokio::test]
+    async fn placeholder_handlers_do_not_return_success() {
+        let state = AppState::new_uninitialized(test_config());
+
         assert_eq!(
             whatsapp_webhook(State(state.clone())).await,
             StatusCode::NOT_IMPLEMENTED
