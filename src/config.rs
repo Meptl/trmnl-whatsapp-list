@@ -15,7 +15,7 @@ const BIND_ADDR: &str = "BIND_ADDR";
 const DEFAULT_DATABASE_PATH: &str = "list.db";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
 
-#[allow(dead_code)]
+#[derive(Clone)]
 pub struct AppConfig {
     pub whatsapp: WhatsAppConfig,
     pub trmnl: TrmnlConfig,
@@ -24,14 +24,14 @@ pub struct AppConfig {
     pub bind_addr: String,
 }
 
-#[allow(dead_code)]
+#[derive(Clone)]
 pub struct WhatsAppConfig {
     pub verify_token: SecretString,
     pub access_token: SecretString,
     pub phone_number_id: String,
 }
 
-#[allow(dead_code)]
+#[derive(Clone)]
 pub struct TrmnlConfig {
     pub token: SecretString,
 }
@@ -43,6 +43,11 @@ pub struct SecretString(String);
 impl SecretString {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    #[cfg(test)]
+    pub fn from_test_value(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
 }
 

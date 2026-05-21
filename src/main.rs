@@ -1,9 +1,14 @@
 #![forbid(unsafe_code)]
 
+mod app;
 mod config;
+mod http;
 
 fn main() -> Result<(), config::ConfigError> {
-    let _config = config::AppConfig::from_env()?;
+    let config = config::AppConfig::from_env()?;
+    let state = app::AppState::new(config);
+    let _router = http::router(state);
+
     Ok(())
 }
 
