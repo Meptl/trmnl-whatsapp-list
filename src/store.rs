@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Row, params};
 
 const CREATE_ENTRIES_TABLE: &str = "\
     CREATE TABLE IF NOT EXISTS entries (
@@ -64,6 +64,40 @@ impl StoreHandle {
         Ok(())
     }
 
+    /// Stores text exactly as supplied; command execution owns normalization and validation.
+    #[allow(dead_code)]
+    pub fn add_entry(&self, text: impl Into<String>) -> Result<Entry, StoreError> {
+        let connection = self.open_connection()?;
+        connection.execute(
+            "INSERT INTO entries (text, created_at) \
+             VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![text.into()],
+        )?;
+
+        let entry_id = connection.last_insert_rowid();
+        let entry = connection.query_row(
+            "SELECT id, text, created_at FROM entries WHERE id = ?1",
+            [entry_id],
+            entry_from_row,
+        )?;
+
+        Ok(entry)
+    }
+
+    #[allow(dead_code)]
+    pub fn list_entries(&self) -> Result<Vec<Entry>, StoreError> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT id, text, created_at FROM entries ORDER BY {ENTRIES_CREATION_ORDER_SQL}"
+        ))?;
+
+        let entries = statement
+            .query_map([], entry_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(entries)
+    }
+
     fn open_connection(&self) -> Result<Connection, StoreError> {
         Ok(Connection::open(&self.database_path)?)
     }
@@ -72,6 +106,15 @@ impl StoreHandle {
     pub fn database_path(&self) -> &std::path::Path {
         &self.database_path
     }
+}
+
+#[allow(dead_code)]
+fn entry_from_row(row: &Row<'_>) -> rusqlite::Result<Entry> {
+    Ok(Entry::new(
+        row.get::<_, i64>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+    ))
 }
 
 #[derive(Debug)]
@@ -168,6 +211,52 @@ mod tests {
         assert_eq!(entry.id(), 7);
         assert_eq!(entry.text(), "milk");
         assert_eq!(entry.created_at(), "2026-05-21T20:24:01Z");
+    }
+
+    #[test]
+    fn add_entry_stores_exact_shared_list_text_including_empty_and_whitespace() {
+        let database = TestDatabase::new("add_exact_text");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+
+        let empty_entry = store.add_entry("").expect("empty entry should insert");
+        let whitespace_entry = store
+            .add_entry("  milk\n")
+            .expect("whitespace entry should insert");
+
+        assert_eq!(empty_entry.text(), "");
+        assert_eq!(whitespace_entry.text(), "  milk\n");
+        assert_ne!(empty_entry.id(), whitespace_entry.id());
+        assert!(empty_entry.created_at().ends_with('Z'));
+        assert!(whitespace_entry.created_at().ends_with('Z'));
+    }
+
+    #[test]
+    fn list_entries_returns_the_shared_list_in_creation_order() {
+        let database = TestDatabase::new("list_shared_creation_order");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+
+        let first = store.add_entry("first").expect("first entry should insert");
+        let second = store
+            .add_entry("second")
+            .expect("second entry should insert");
+        let third = store.add_entry("third").expect("third entry should insert");
+
+        let entries = store.list_entries().expect("entries should list");
+
+        assert_eq!(entries, [first, second, third]);
+    }
+
+    #[test]
+    fn list_entries_returns_empty_shared_list() {
+        let database = TestDatabase::new("list_empty_shared");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+
+        let entries = store.list_entries().expect("entries should list");
+
+        assert!(entries.is_empty());
     }
 
     #[test]
