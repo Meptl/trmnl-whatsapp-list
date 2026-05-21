@@ -11,6 +11,40 @@ const CREATE_ENTRIES_TABLE: &str = "\
         created_at TEXT NOT NULL
     )";
 
+#[allow(dead_code)]
+pub(crate) const ENTRIES_CREATION_ORDER_SQL: &str = "created_at ASC, id ASC";
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Entry {
+    id: i64,
+    text: String,
+    created_at: String,
+}
+
+#[allow(dead_code)]
+impl Entry {
+    pub fn new(id: i64, text: impl Into<String>, created_at: impl Into<String>) -> Self {
+        Self {
+            id,
+            text: text.into(),
+            created_at: created_at.into(),
+        }
+    }
+
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn created_at(&self) -> &str {
+        &self.created_at
+    }
+}
+
 #[derive(Clone)]
 pub struct StoreHandle {
     database_path: PathBuf,
@@ -125,6 +159,94 @@ mod tests {
         let table_names = table_names(&connection);
 
         assert_eq!(table_names, ["entries"]);
+    }
+
+    #[test]
+    fn entry_exposes_values_without_public_fields() {
+        let entry = Entry::new(7, "milk", "2026-05-21T20:24:01Z");
+
+        assert_eq!(entry.id(), 7);
+        assert_eq!(entry.text(), "milk");
+        assert_eq!(entry.created_at(), "2026-05-21T20:24:01Z");
+    }
+
+    #[test]
+    fn creation_order_sql_stabilizes_equal_timestamps_by_id() {
+        let database = TestDatabase::new("creation_order");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+        let connection = Connection::open(database.path()).expect("database should open");
+
+        insert_entry(&connection, "middle-a", "2026-05-21T20:24:01Z");
+        insert_entry(&connection, "first", "2026-05-21T20:24:00Z");
+        insert_entry(&connection, "middle-b", "2026-05-21T20:24:01Z");
+        insert_entry(&connection, "last", "2026-05-21T20:24:02Z");
+
+        let ordered_ids = ordered_entry_ids(&connection);
+        let first_id = entry_id_by_text(&connection, "first");
+        let middle_a_id = entry_id_by_text(&connection, "middle-a");
+        let middle_b_id = entry_id_by_text(&connection, "middle-b");
+        let last_id = entry_id_by_text(&connection, "last");
+
+        assert_eq!(ordered_ids, [first_id, middle_a_id, middle_b_id, last_id]);
+    }
+
+    #[test]
+    fn displayed_positions_are_one_based_creation_order_indexes() {
+        let database = TestDatabase::new("position_mapping");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+        let connection = Connection::open(database.path()).expect("database should open");
+
+        insert_entry(&connection, "first", "2026-05-21T20:24:00Z");
+        insert_entry(&connection, "second", "2026-05-21T20:24:01Z");
+        insert_entry(&connection, "third", "2026-05-21T20:24:01Z");
+
+        let displayed_positions = ordered_entry_ids(&connection)
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| (index + 1, id))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            displayed_positions,
+            [
+                (1, entry_id_by_text(&connection, "first")),
+                (2, entry_id_by_text(&connection, "second")),
+                (3, entry_id_by_text(&connection, "third")),
+            ]
+        );
+    }
+
+    fn insert_entry(connection: &Connection, text: &str, created_at: &str) {
+        connection
+            .execute(
+                "INSERT INTO entries (text, created_at) VALUES (?1, ?2)",
+                (text, created_at),
+            )
+            .expect("entry should insert");
+    }
+
+    fn ordered_entry_ids(connection: &Connection) -> Vec<i64> {
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT id FROM entries ORDER BY {ENTRIES_CREATION_ORDER_SQL}"
+            ))
+            .expect("ordered ids statement should prepare");
+
+        statement
+            .query_map([], |row| row.get(0))
+            .expect("ordered ids should query")
+            .collect::<Result<Vec<i64>, _>>()
+            .expect("ordered ids should collect")
+    }
+
+    fn entry_id_by_text(connection: &Connection, text: &str) -> i64 {
+        connection
+            .query_row("SELECT id FROM entries WHERE text = ?1", [text], |row| {
+                row.get(0)
+            })
+            .expect("entry id should query by text")
     }
 
     fn table_columns(connection: &Connection, table_name: &str) -> Vec<String> {
