@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 mod app;
+#[allow(dead_code)]
+mod commands;
 mod config;
 mod http;
 mod store;
