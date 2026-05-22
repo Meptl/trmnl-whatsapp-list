@@ -307,6 +307,26 @@ mod tests {
     }
 
     #[test]
+    fn initialize_creates_entries_table_from_empty_file() {
+        let database = TestDatabase::new("creates_entries_table_from_empty_file");
+        fs::File::create(database.path()).expect("empty database file should create");
+        assert_eq!(
+            fs::metadata(database.path())
+                .expect("empty database file metadata should read")
+                .len(),
+            0
+        );
+        let store = StoreHandle::new(database.path());
+
+        store.initialize().expect("store should initialize");
+
+        let connection = Connection::open(database.path()).expect("database should open");
+        let columns = table_columns(&connection, "entries");
+
+        assert_eq!(columns, ["id", "text", "created_at"]);
+    }
+
+    #[test]
     fn initialize_is_idempotent() {
         let database = TestDatabase::new("idempotent");
         let store = StoreHandle::new(database.path());
