@@ -131,10 +131,17 @@ async fn trmnl_image(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-async fn trmnl_log(State(state): State<AppState>) -> StatusCode {
+async fn trmnl_log(State(state): State<AppState>, body: String) -> StatusCode {
     acknowledge_state_shape(&state);
 
-    StatusCode::NOT_IMPLEMENTED
+    if body.trim().is_empty() {
+        return StatusCode::OK;
+    }
+
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(_) => StatusCode::OK,
+        Err(_) => StatusCode::BAD_REQUEST,
+    }
 }
 
 fn acknowledge_state_shape(state: &AppState) {
@@ -704,10 +711,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn placeholder_handlers_do_not_return_success() {
+    async fn trmnl_log_accepts_representative_json_telemetry() {
         let state = AppState::new_uninitialized(test_config());
 
-        assert_eq!(trmnl_log(State(state)).await, StatusCode::NOT_IMPLEMENTED);
+        let status = trmnl_log(
+            State(state),
+            r#"{
+                "device": "trmnl",
+                "battery_voltage": 4.12,
+                "wifi_signal": -61,
+                "refresh_rate": 900,
+                "firmware_version": "1.0.0"
+            }"#
+            .to_owned(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn trmnl_log_does_not_mutate_list_entries() {
+        let database = TestDatabase::new("trmnl_log_no_mutation");
+        let state = initialized_state(&database);
+        state.store.add_entry("milk").expect("entry should insert");
+
+        let status = trmnl_log(
+            State(state.clone()),
+            r#"{"device":"trmnl","event":"refresh"}"#.to_owned(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            execute_command(&state.store, Command::ListEntries)
+                .expect("list command should execute"),
+            "1. milk"
+        );
+    }
+
+    #[tokio::test]
+    async fn trmnl_log_rejects_invalid_json_without_secret_response_body() {
+        let state = AppState::new_uninitialized(test_config());
+
+        assert_eq!(
+            trmnl_log(State(state), "{".to_owned()).await,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]
