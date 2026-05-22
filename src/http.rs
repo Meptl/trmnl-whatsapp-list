@@ -29,6 +29,11 @@ struct WhatsAppVerifyQuery {
     challenge: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct TrmnlTokenQuery {
+    token: Option<String>,
+}
+
 async fn whatsapp_verify(
     State(state): State<AppState>,
     Query(query): Query<WhatsAppVerifyQuery>,
@@ -86,16 +91,24 @@ fn whatsapp_webhook_status(result: Result<(), WhatsAppWebhookError>) -> StatusCo
     }
 }
 
-async fn trmnl_display(State(state): State<AppState>) -> StatusCode {
+async fn trmnl_display(
+    State(state): State<AppState>,
+    Query(query): Query<TrmnlTokenQuery>,
+) -> Result<StatusCode, StatusCode> {
     acknowledge_state_shape(&state);
+    validate_trmnl_token(&state, query)?;
 
-    StatusCode::NOT_IMPLEMENTED
+    Ok(StatusCode::NOT_IMPLEMENTED)
 }
 
-async fn trmnl_image(State(state): State<AppState>) -> StatusCode {
+async fn trmnl_image(
+    State(state): State<AppState>,
+    Query(query): Query<TrmnlTokenQuery>,
+) -> Result<StatusCode, StatusCode> {
     acknowledge_state_shape(&state);
+    validate_trmnl_token(&state, query)?;
 
-    StatusCode::NOT_IMPLEMENTED
+    Ok(StatusCode::NOT_IMPLEMENTED)
 }
 
 async fn trmnl_log(State(state): State<AppState>) -> StatusCode {
@@ -106,6 +119,13 @@ async fn trmnl_log(State(state): State<AppState>) -> StatusCode {
 
 fn acknowledge_state_shape(state: &AppState) {
     let _ = (&state.config, &state.store, &state.whatsapp_client);
+}
+
+fn validate_trmnl_token(state: &AppState, query: TrmnlTokenQuery) -> Result<(), StatusCode> {
+    match query.token {
+        Some(token) if token == state.config.trmnl.token.as_str() => Ok(()),
+        _ => Err(StatusCode::FORBIDDEN),
+    }
 }
 
 async fn process_whatsapp_webhook<SendReply, SendReplyFuture>(
@@ -219,14 +239,66 @@ mod tests {
         let state = AppState::new_uninitialized(test_config());
 
         assert_eq!(
-            trmnl_display(State(state.clone())).await,
-            StatusCode::NOT_IMPLEMENTED
+            trmnl_display(
+                State(state.clone()),
+                Query(TrmnlTokenQuery {
+                    token: Some("trmnl-secret".to_owned()),
+                }),
+            )
+            .await,
+            Ok(StatusCode::NOT_IMPLEMENTED)
         );
         assert_eq!(
-            trmnl_image(State(state.clone())).await,
-            StatusCode::NOT_IMPLEMENTED
+            trmnl_image(
+                State(state.clone()),
+                Query(TrmnlTokenQuery {
+                    token: Some("trmnl-secret".to_owned()),
+                }),
+            )
+            .await,
+            Ok(StatusCode::NOT_IMPLEMENTED)
         );
         assert_eq!(trmnl_log(State(state)).await, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn trmnl_display_rejects_wrong_or_missing_token() {
+        let state = AppState::new_uninitialized(test_config());
+
+        assert_eq!(
+            trmnl_display(
+                State(state.clone()),
+                Query(TrmnlTokenQuery {
+                    token: Some("wrong-secret".to_owned()),
+                }),
+            )
+            .await,
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            trmnl_display(State(state), Query(TrmnlTokenQuery { token: None })).await,
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[tokio::test]
+    async fn trmnl_image_rejects_wrong_or_missing_token() {
+        let state = AppState::new_uninitialized(test_config());
+
+        assert_eq!(
+            trmnl_image(
+                State(state.clone()),
+                Query(TrmnlTokenQuery {
+                    token: Some("wrong-secret".to_owned()),
+                }),
+            )
+            .await,
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            trmnl_image(State(state), Query(TrmnlTokenQuery { token: None })).await,
+            Err(StatusCode::FORBIDDEN)
+        );
     }
 
     #[tokio::test]
