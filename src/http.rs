@@ -46,12 +46,30 @@ async fn whatsapp_verify(
 }
 
 async fn whatsapp_webhook(State(state): State<AppState>, body: String) -> StatusCode {
-    match process_whatsapp_webhook(&state.store, &body, |sender, reply| {
-        let client = state.whatsapp_client.clone();
-        async move { client.send_text_reply(&sender, &reply).await }
-    })
-    .await
-    {
+    whatsapp_webhook_status(
+        process_whatsapp_webhook(&state.store, &body, |sender, reply| {
+            let client = state.whatsapp_client.clone();
+            async move { client.send_text_reply(&sender, &reply).await }
+        })
+        .await,
+    )
+}
+
+#[cfg(test)]
+async fn whatsapp_webhook_with_reply_sender<SendReply, SendReplyFuture>(
+    State(state): State<AppState>,
+    body: String,
+    send_reply: SendReply,
+) -> StatusCode
+where
+    SendReply: FnMut(String, String) -> SendReplyFuture,
+    SendReplyFuture: Future<Output = Result<(), WhatsAppReplyError>>,
+{
+    whatsapp_webhook_status(process_whatsapp_webhook(&state.store, &body, send_reply).await)
+}
+
+fn whatsapp_webhook_status(result: Result<(), WhatsAppWebhookError>) -> StatusCode {
+    match result {
         Ok(()) => StatusCode::OK,
         Err(WhatsAppWebhookError::Payload(error)) => {
             let _ = error;
@@ -214,16 +232,20 @@ mod tests {
     #[tokio::test]
     async fn whatsapp_webhook_processes_text_messages_in_payload_order() {
         let database = TestDatabase::new("webhook_processes_messages");
-        let store = initialized_store(&database);
+        let state = initialized_state(&database);
         let mut sent_replies = Vec::new();
 
-        process_whatsapp_webhook(&store, multi_message_payload(), |sender, reply| {
-            sent_replies.push((sender, reply));
-            async { Ok(()) }
-        })
-        .await
-        .expect("webhook should process");
+        let status = whatsapp_webhook_with_reply_sender(
+            State(state.clone()),
+            multi_message_payload().to_owned(),
+            |sender, reply| {
+                sent_replies.push((sender, reply));
+                async { Ok(()) }
+            },
+        )
+        .await;
 
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(
             sent_replies,
             [
@@ -234,7 +256,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            execute_command(&store, Command::ListEntries).expect("list command should execute"),
+            execute_command(&state.store, Command::ListEntries)
+                .expect("list command should execute"),
             "1. eggs"
         );
     }
@@ -242,19 +265,24 @@ mod tests {
     #[tokio::test]
     async fn whatsapp_webhook_ignores_status_and_non_text_payloads() {
         let database = TestDatabase::new("webhook_ignores_non_text");
-        let store = initialized_store(&database);
+        let state = initialized_state(&database);
         let mut sent_replies = Vec::new();
 
-        process_whatsapp_webhook(&store, status_and_non_text_payload(), |sender, reply| {
-            sent_replies.push((sender, reply));
-            async { Ok(()) }
-        })
-        .await
-        .expect("webhook should accept ignored payload");
+        let status = whatsapp_webhook_with_reply_sender(
+            State(state.clone()),
+            status_and_non_text_payload().to_owned(),
+            |sender, reply| {
+                sent_replies.push((sender, reply));
+                async { Ok(()) }
+            },
+        )
+        .await;
 
+        assert_eq!(status, StatusCode::OK);
         assert!(sent_replies.is_empty());
         assert_eq!(
-            execute_command(&store, Command::ListEntries).expect("list command should execute"),
+            execute_command(&state.store, Command::ListEntries)
+                .expect("list command should execute"),
             "The list is empty."
         );
     }
@@ -285,10 +313,11 @@ mod tests {
         }
     }
 
-    fn initialized_store(database: &TestDatabase) -> StoreHandle {
-        let store = StoreHandle::new(database.path());
-        store.initialize().expect("store should initialize");
-        store
+    fn initialized_state(database: &TestDatabase) -> AppState {
+        let mut config = test_config();
+        config.database_path = database.path().to_path_buf();
+
+        AppState::new(config).expect("app state should initialize")
     }
 
     fn multi_message_payload() -> &'static str {
