@@ -52,6 +52,23 @@ pub enum RemoveEntryResult {
     NotFound,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClearEntriesResult {
+    deleted_count: usize,
+}
+
+#[allow(dead_code)]
+impl ClearEntriesResult {
+    pub fn new(deleted_count: usize) -> Self {
+        Self { deleted_count }
+    }
+
+    pub fn deleted_count(&self) -> usize {
+        self.deleted_count
+    }
+}
+
 #[derive(Clone)]
 pub struct StoreHandle {
     database_path: PathBuf,
@@ -157,6 +174,14 @@ impl StoreHandle {
             }
             None => Ok(RemoveEntryResult::NotFound),
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_entries(&self) -> Result<ClearEntriesResult, StoreError> {
+        let connection = self.open_connection()?;
+        let deleted_count = connection.execute("DELETE FROM entries", [])?;
+
+        Ok(ClearEntriesResult::new(deleted_count))
     }
 
     fn open_connection(&self) -> Result<Connection, StoreError> {
@@ -567,6 +592,58 @@ mod tests {
 
         assert_eq!(result, RemoveEntryResult::NotFound);
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn clear_entries_removes_multiple_entries_and_returns_removed_count() {
+        let database = TestDatabase::new("clear_multiple");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+        let connection = Connection::open(database.path()).expect("database should open");
+
+        insert_entry(&connection, "first", "2026-05-21T20:24:00Z");
+        insert_entry(&connection, "second", "2026-05-21T20:24:01Z");
+        insert_entry(&connection, "third", "2026-05-21T20:24:02Z");
+
+        let result = store.clear_entries().expect("entries should clear");
+        let entries = store.list_entries().expect("entries should list");
+
+        assert_eq!(result.deleted_count(), 3);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn clear_entries_on_empty_database_succeeds_and_returns_zero() {
+        let database = TestDatabase::new("clear_empty");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+
+        let result = store.clear_entries().expect("empty list should clear");
+        let entries = store.list_entries().expect("entries should list");
+
+        assert_eq!(result.deleted_count(), 0);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn clear_entries_is_idempotent_when_called_twice() {
+        let database = TestDatabase::new("clear_idempotent");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+        let connection = Connection::open(database.path()).expect("database should open");
+
+        insert_entry(&connection, "first", "2026-05-21T20:24:00Z");
+        insert_entry(&connection, "second", "2026-05-21T20:24:01Z");
+
+        let first_result = store.clear_entries().expect("entries should clear");
+        let second_result = store
+            .clear_entries()
+            .expect("empty list should clear again");
+        let entries = store.list_entries().expect("entries should list");
+
+        assert_eq!(first_result.deleted_count(), 2);
+        assert_eq!(second_result.deleted_count(), 0);
+        assert!(entries.is_empty());
     }
 
     #[test]
