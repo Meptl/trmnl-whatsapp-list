@@ -1,11 +1,12 @@
 use crate::config::AppConfig;
 use crate::store::{StoreError, StoreHandle};
+use crate::whatsapp::WhatsAppReplyClient;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
     pub store: StoreHandle,
-    pub whatsapp_client: WhatsAppClientHandle,
+    pub whatsapp_client: WhatsAppReplyClient,
 }
 
 impl AppState {
@@ -14,9 +15,9 @@ impl AppState {
         store.initialize()?;
 
         Ok(Self {
+            whatsapp_client: WhatsAppReplyClient::new(&config.whatsapp),
             config,
             store,
-            whatsapp_client: WhatsAppClientHandle,
         })
     }
 }
@@ -26,14 +27,11 @@ impl AppState {
     pub fn new_uninitialized(config: AppConfig) -> Self {
         Self {
             store: StoreHandle::new(config.database_path.clone()),
+            whatsapp_client: WhatsAppReplyClient::new(&config.whatsapp),
             config,
-            whatsapp_client: WhatsAppClientHandle,
         }
     }
 }
-
-#[derive(Clone)]
-pub struct WhatsAppClientHandle;
 
 #[cfg(test)]
 mod tests {
