@@ -18,21 +18,17 @@ The implemented foundation currently includes:
 - Secret wrapper debug output that redacts token values.
 - Axum startup that loads configuration, initializes application state, binds
   `BIND_ADDR`, and serves requests.
-- Router skeleton for WhatsApp and TRMNL endpoints.
+- Router for WhatsApp and TRMNL endpoints.
 - WhatsApp verification for `GET /webhooks/whatsapp`.
 - SQLite persistence initialization and list operations.
 - Command parsing and execution for add, list, remove, clear, help, and ignored
   empty input.
 - WhatsApp Cloud API webhook payload parsing for inbound text messages.
-- Meta Graph API text reply request construction and sending.
-- Initial dependencies for TRMNL response types and PNG rendering.
-
-Endpoint flows are not complete yet. `POST /webhooks/whatsapp`,
-`GET /api/display`, `GET /trmnl/list.png`, and `POST /api/log` are registered but
-currently return `501 Not Implemented`. Command execution, WhatsApp payload
-parsing, and the Meta reply client are implemented below those handlers but are
-not yet composed into the webhook POST flow. TRMNL display responses, PNG
-rendering, and telemetry handling are still planned.
+- Meta Graph API text reply request construction and sending through the
+  WhatsApp webhook POST flow.
+- TRMNL BYOS display response generation.
+- TRMNL 800x480 PNG rendering for the current list.
+- TRMNL telemetry acceptance for empty bodies or valid JSON.
 
 ## Configuration
 
@@ -72,8 +68,7 @@ The service is split into these responsibilities:
 - Command parsing and execution stay independent of WhatsApp payload shapes,
   Meta transport, and HTTP handlers.
 - WhatsApp integration targets the official Meta WhatsApp Cloud API only.
-- TRMNL integration is intended to expose BYOS display, PNG image, and telemetry
-  endpoints.
+- TRMNL integration exposes BYOS display, PNG image, and telemetry endpoints.
 
 ## Data Model
 
@@ -108,17 +103,20 @@ The Axum routes are:
 - `GET /trmnl/list.png`
 - `POST /api/log`
 
-TRMNL endpoints that expose display content are intended to require the shared
-`TRMNL_TOKEN`. WhatsApp verification compares Meta's `hub.verify_token` against
+TRMNL endpoints that expose display content require the shared `TRMNL_TOKEN`.
+WhatsApp verification compares Meta's `hub.verify_token` against
 `WHATSAPP_VERIFY_TOKEN` and returns the provided challenge only on a match.
 
-Current handler status:
+Handler behavior:
 
-- `GET /webhooks/whatsapp` is implemented.
-- `POST /webhooks/whatsapp` is registered but returns `501 Not Implemented`.
-- `GET /api/display` is registered but returns `501 Not Implemented`.
-- `GET /trmnl/list.png` is registered but returns `501 Not Implemented`.
-- `POST /api/log` is registered but returns `501 Not Implemented`.
+- `GET /webhooks/whatsapp` verifies Meta's challenge.
+- `POST /webhooks/whatsapp` parses inbound text messages, executes commands,
+  and sends replies.
+- `GET /api/display` returns a TRMNL display response containing the list PNG
+  URL.
+- `GET /trmnl/list.png` renders the current list as an 800x480 PNG.
+- `POST /api/log` accepts empty telemetry bodies or valid JSON and rejects
+  invalid JSON.
 
 ## WhatsApp Components
 

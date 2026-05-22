@@ -49,7 +49,7 @@ rules into Axum-specific code.
 
 ## TRMNL BYOS
 
-TRMNL integration is planned around BYOS endpoints:
+TRMNL integration uses BYOS endpoints:
 
 - display metadata at `/api/display`
 - rendered PNG at `/trmnl/list.png`
@@ -58,8 +58,7 @@ TRMNL integration is planned around BYOS endpoints:
 Display content should stay e-ink friendly: list title, entry count, current
 entries in creation order, an empty state, and a generated timestamp.
 
-TRMNL display and image endpoints are intended to require the shared
-`TRMNL_TOKEN`.
+TRMNL display and image endpoints require the shared `TRMNL_TOKEN`.
 
 ## Compatibility
 
