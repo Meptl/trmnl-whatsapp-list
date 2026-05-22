@@ -1,7 +1,12 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::body::Body;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use image::ImageEncoder;
 use serde::Deserialize;
 
 use crate::app::AppState;
@@ -109,11 +114,21 @@ async fn trmnl_display(
 async fn trmnl_image(
     State(state): State<AppState>,
     Query(query): Query<TrmnlTokenQuery>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Response, StatusCode> {
     acknowledge_state_shape(&state);
     validate_trmnl_token(&state, query)?;
 
-    Ok(StatusCode::NOT_IMPLEMENTED)
+    let entries = state
+        .store
+        .list_entries()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let png = render_trmnl_list_png(&entries).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/png")
+        .body(Body::from(png))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn trmnl_log(State(state): State<AppState>) -> StatusCode {
@@ -148,6 +163,309 @@ fn percent_encode_query_component(value: &str) -> String {
     }
 
     encoded
+}
+
+const TRMNL_IMAGE_WIDTH: u32 = 800;
+const TRMNL_IMAGE_HEIGHT: u32 = 480;
+const TRMNL_MARGIN: u32 = 32;
+const FONT_WIDTH: u32 = 3;
+const FONT_HEIGHT: u32 = 5;
+const FONT_SCALE: u32 = 4;
+const FONT_SPACING: u32 = 2;
+const LINE_HEIGHT: u32 = FONT_HEIGHT * FONT_SCALE + 9;
+const BLACK: [u8; 4] = [0, 0, 0, 255];
+const WHITE: [u8; 4] = [255, 255, 255, 255];
+const LIGHT_GRAY: [u8; 4] = [224, 224, 224, 255];
+
+fn render_trmnl_list_png(entries: &[crate::store::Entry]) -> Result<Vec<u8>, image::ImageError> {
+    let mut canvas = Canvas::new(TRMNL_IMAGE_WIDTH, TRMNL_IMAGE_HEIGHT, WHITE);
+    let generated_at = generated_timestamp();
+    let entry_count = format!("{} entries", entries.len());
+
+    canvas.draw_text("List", TRMNL_MARGIN, 24, 8, BLACK);
+    canvas.draw_text(&entry_count, TRMNL_MARGIN, 78, 3, BLACK);
+    canvas.draw_horizontal_line(
+        TRMNL_MARGIN,
+        112,
+        TRMNL_IMAGE_WIDTH - TRMNL_MARGIN,
+        LIGHT_GRAY,
+    );
+
+    let max_chars = chars_per_line(TRMNL_IMAGE_WIDTH - (TRMNL_MARGIN * 2), FONT_SCALE);
+    let footer_y = TRMNL_IMAGE_HEIGHT - 42;
+    let mut y = 130;
+
+    if entries.is_empty() {
+        canvas.draw_text("No entries", TRMNL_MARGIN, y, FONT_SCALE, BLACK);
+    } else {
+        for (index, entry) in entries.iter().enumerate() {
+            if y + LINE_HEIGHT > footer_y {
+                break;
+            }
+
+            let prefix = format!("{}. ", index + 1);
+            let line_width = max_chars.saturating_sub(prefix.chars().count()).max(8);
+            let lines = wrap_text(entry.text(), line_width);
+
+            for (line_index, line) in lines.iter().enumerate() {
+                if y + LINE_HEIGHT > footer_y {
+                    break;
+                }
+
+                if line_index == 0 {
+                    canvas.draw_text(
+                        &format!("{prefix}{line}"),
+                        TRMNL_MARGIN,
+                        y,
+                        FONT_SCALE,
+                        BLACK,
+                    );
+                } else {
+                    let indent = text_width(&prefix, FONT_SCALE);
+                    canvas.draw_text(line, TRMNL_MARGIN + indent, y, FONT_SCALE, BLACK);
+                }
+                y += LINE_HEIGHT;
+            }
+            y += 6;
+        }
+    }
+
+    canvas.draw_horizontal_line(
+        TRMNL_MARGIN,
+        footer_y - 14,
+        TRMNL_IMAGE_WIDTH - TRMNL_MARGIN,
+        LIGHT_GRAY,
+    );
+    canvas.draw_text(&generated_at, TRMNL_MARGIN, footer_y, 3, BLACK);
+
+    let mut png = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png);
+    encoder.write_image(
+        canvas.pixels(),
+        TRMNL_IMAGE_WIDTH,
+        TRMNL_IMAGE_HEIGHT,
+        image::ColorType::Rgba8.into(),
+    )?;
+
+    Ok(png)
+}
+
+fn generated_timestamp() -> String {
+    let seconds = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => 0,
+    };
+
+    format!("Generated: {seconds}s since Unix epoch")
+}
+
+fn chars_per_line(width: u32, scale: u32) -> usize {
+    let glyph_width = FONT_WIDTH * scale + FONT_SPACING;
+    usize::try_from(width / glyph_width).map_or(0, |count| count)
+}
+
+fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
+    let normalized = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in normalized.split_whitespace() {
+        if word.chars().count() > max_chars {
+            push_current_line(&mut lines, &mut current);
+            push_long_word(&mut lines, word, max_chars);
+            continue;
+        }
+
+        let separator = usize::from(!current.is_empty());
+        if current.chars().count() + separator + word.chars().count() > max_chars {
+            push_current_line(&mut lines, &mut current);
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+
+    push_current_line(&mut lines, &mut current);
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    lines
+}
+
+fn push_current_line(lines: &mut Vec<String>, current: &mut String) {
+    if !current.is_empty() {
+        lines.push(std::mem::take(current));
+    }
+}
+
+fn push_long_word(lines: &mut Vec<String>, word: &str, max_chars: usize) {
+    let mut chunk = String::new();
+    for character in word.chars() {
+        if chunk.chars().count() == max_chars {
+            lines.push(std::mem::take(&mut chunk));
+        }
+        chunk.push(character);
+    }
+    if !chunk.is_empty() {
+        lines.push(chunk);
+    }
+}
+
+fn text_width(text: &str, scale: u32) -> u32 {
+    let glyph_width = FONT_WIDTH * scale + FONT_SPACING;
+    let count = u32::try_from(text.chars().count()).map_or(0, |count| count);
+
+    count.saturating_mul(glyph_width)
+}
+
+struct Canvas {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+impl Canvas {
+    fn new(width: u32, height: u32, color: [u8; 4]) -> Self {
+        let pixel_count = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .map_or(0, |pixel_count| pixel_count);
+        let mut pixels = Vec::with_capacity(pixel_count.saturating_mul(4));
+        for _ in 0..pixel_count {
+            pixels.extend_from_slice(&color);
+        }
+
+        Self {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    fn draw_text(&mut self, text: &str, x: u32, y: u32, scale: u32, color: [u8; 4]) {
+        let mut cursor_x = x;
+        for character in text.chars() {
+            self.draw_glyph(character, cursor_x, y, scale, color);
+            cursor_x = cursor_x.saturating_add(FONT_WIDTH * scale + FONT_SPACING);
+        }
+    }
+
+    fn draw_glyph(&mut self, character: char, x: u32, y: u32, scale: u32, color: [u8; 4]) {
+        let bits = glyph_bits(character);
+        for row in 0..FONT_HEIGHT {
+            for column in 0..FONT_WIDTH {
+                let offset = row * FONT_WIDTH + column;
+                let mask = 1 << ((FONT_WIDTH * FONT_HEIGHT - 1) - offset);
+                if bits & mask != 0 {
+                    self.fill_rect(x + column * scale, y + row * scale, scale, scale, color);
+                }
+            }
+        }
+    }
+
+    fn draw_horizontal_line(&mut self, x1: u32, y: u32, x2: u32, color: [u8; 4]) {
+        let width = x2.saturating_sub(x1);
+        self.fill_rect(x1, y, width, 2, color);
+    }
+
+    fn fill_rect(&mut self, x: u32, y: u32, width: u32, height: u32, color: [u8; 4]) {
+        let end_x = x.saturating_add(width).min(self.width);
+        let end_y = y.saturating_add(height).min(self.height);
+        for pixel_y in y..end_y {
+            for pixel_x in x..end_x {
+                self.set_pixel(pixel_x, pixel_y, color);
+            }
+        }
+    }
+
+    fn set_pixel(&mut self, x: u32, y: u32, color: [u8; 4]) {
+        let Some(index) = pixel_index(self.width, x, y) else {
+            return;
+        };
+        let Some(pixel) = self.pixels.get_mut(index..index + 4) else {
+            return;
+        };
+
+        pixel.copy_from_slice(&color);
+    }
+}
+
+fn pixel_index(width: u32, x: u32, y: u32) -> Option<usize> {
+    let width = usize::try_from(width).ok()?;
+    let x = usize::try_from(x).ok()?;
+    let y = usize::try_from(y).ok()?;
+
+    y.checked_mul(width)?.checked_add(x)?.checked_mul(4)
+}
+
+fn glyph_bits(character: char) -> u16 {
+    match character.to_ascii_uppercase() {
+        'A' => 0b010_101_111_101_101,
+        'B' => 0b110_101_110_101_110,
+        'C' => 0b011_100_100_100_011,
+        'D' => 0b110_101_101_101_110,
+        'E' => 0b111_100_110_100_111,
+        'F' => 0b111_100_110_100_100,
+        'G' => 0b011_100_101_101_011,
+        'H' => 0b101_101_111_101_101,
+        'I' => 0b111_010_010_010_111,
+        'J' => 0b001_001_001_101_010,
+        'K' => 0b101_101_110_101_101,
+        'L' => 0b100_100_100_100_111,
+        'M' => 0b101_111_111_101_101,
+        'N' => 0b101_111_111_111_101,
+        'O' => 0b010_101_101_101_010,
+        'P' => 0b110_101_110_100_100,
+        'Q' => 0b010_101_101_111_011,
+        'R' => 0b110_101_110_101_101,
+        'S' => 0b011_100_010_001_110,
+        'T' => 0b111_010_010_010_010,
+        'U' => 0b101_101_101_101_111,
+        'V' => 0b101_101_101_101_010,
+        'W' => 0b101_101_111_111_101,
+        'X' => 0b101_101_010_101_101,
+        'Y' => 0b101_101_010_010_010,
+        'Z' => 0b111_001_010_100_111,
+        '0' => 0b111_101_101_101_111,
+        '1' => 0b010_110_010_010_111,
+        '2' => 0b110_001_010_100_111,
+        '3' => 0b110_001_010_001_110,
+        '4' => 0b101_101_111_001_001,
+        '5' => 0b111_100_110_001_110,
+        '6' => 0b011_100_110_101_010,
+        '7' => 0b111_001_010_010_010,
+        '8' => 0b010_101_010_101_010,
+        '9' => 0b010_101_011_001_110,
+        '.' => 0b000_000_000_000_010,
+        ':' => 0b000_010_000_010_000,
+        '-' => 0b000_000_111_000_000,
+        '/' => 0b001_001_010_100_100,
+        '&' => 0b010_101_010_101_011,
+        '+' => 0b000_010_111_010_000,
+        '#' => 0b101_111_101_111_101,
+        '=' => 0b000_111_000_111_000,
+        ' ' => 0,
+        _ => 0b111_001_010_000_010,
+    }
 }
 
 async fn process_whatsapp_webhook<SendReply, SendReplyFuture>(
@@ -302,19 +620,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trmnl_image_returns_png_for_valid_token() {
+        let database = TestDatabase::new("trmnl_image_png");
+        let state = initialized_state(&database);
+        state
+            .store
+            .add_entry("milk")
+            .expect("first entry should insert");
+        state
+            .store
+            .add_entry("eggs")
+            .expect("second entry should insert");
+
+        let response = trmnl_image(
+            State(state),
+            Query(TrmnlTokenQuery {
+                token: Some("trmnl-secret".to_owned()),
+            }),
+        )
+        .await
+        .expect("valid token should return image response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("image/png"))
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("image body should read");
+        let image = image::load_from_memory(&bytes).expect("body should decode as image");
+
+        assert_eq!(image.width(), 800);
+        assert_eq!(image.height(), 480);
+    }
+
+    #[tokio::test]
+    async fn trmnl_image_returns_png_for_empty_list() {
+        let database = TestDatabase::new("trmnl_image_empty");
+        let state = initialized_state(&database);
+
+        let response = trmnl_image(
+            State(state),
+            Query(TrmnlTokenQuery {
+                token: Some("trmnl-secret".to_owned()),
+            }),
+        )
+        .await
+        .expect("valid token should return image response");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("image body should read");
+        let image = image::load_from_memory(&bytes).expect("body should decode as image");
+
+        assert_eq!(image.width(), 800);
+        assert_eq!(image.height(), 480);
+    }
+
+    #[tokio::test]
+    async fn trmnl_image_handles_long_entries() {
+        let database = TestDatabase::new("trmnl_image_long_entry");
+        let state = initialized_state(&database);
+        state
+            .store
+            .add_entry("a".repeat(500))
+            .expect("long entry should insert");
+
+        let response = trmnl_image(
+            State(state),
+            Query(TrmnlTokenQuery {
+                token: Some("trmnl-secret".to_owned()),
+            }),
+        )
+        .await
+        .expect("valid token should return image response");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("image body should read");
+        let image = image::load_from_memory(&bytes).expect("body should decode as image");
+
+        assert_eq!(image.width(), 800);
+        assert_eq!(image.height(), 480);
+    }
+
+    #[tokio::test]
     async fn placeholder_handlers_do_not_return_success() {
         let state = AppState::new_uninitialized(test_config());
 
-        assert_eq!(
-            trmnl_image(
-                State(state.clone()),
-                Query(TrmnlTokenQuery {
-                    token: Some("trmnl-secret".to_owned()),
-                }),
-            )
-            .await,
-            Ok(StatusCode::NOT_IMPLEMENTED)
-        );
         assert_eq!(trmnl_log(State(state)).await, StatusCode::NOT_IMPLEMENTED);
     }
 
@@ -342,7 +734,7 @@ mod tests {
     async fn trmnl_image_rejects_wrong_or_missing_token() {
         let state = AppState::new_uninitialized(test_config());
 
-        assert_eq!(
+        assert!(matches!(
             trmnl_image(
                 State(state.clone()),
                 Query(TrmnlTokenQuery {
@@ -351,11 +743,11 @@ mod tests {
             )
             .await,
             Err(StatusCode::FORBIDDEN)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             trmnl_image(State(state), Query(TrmnlTokenQuery { token: None })).await,
             Err(StatusCode::FORBIDDEN)
-        );
+        ));
     }
 
     #[tokio::test]
