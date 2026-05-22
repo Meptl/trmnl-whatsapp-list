@@ -82,15 +82,15 @@ fn whatsapp_webhook_status(result: Result<(), WhatsAppWebhookError>) -> StatusCo
     match result {
         Ok(()) => StatusCode::OK,
         Err(WhatsAppWebhookError::Payload(error)) => {
-            let _ = error;
+            eprintln!("Invalid WhatsApp webhook payload: {error}");
             StatusCode::BAD_REQUEST
         }
         Err(WhatsAppWebhookError::Command(error)) => {
-            let _ = error;
+            eprintln!("Failed to update list from WhatsApp webhook: {error}");
             StatusCode::INTERNAL_SERVER_ERROR
         }
         Err(WhatsAppWebhookError::Reply(error)) => {
-            let _ = error;
+            eprintln!("Failed to send WhatsApp reply: {error}");
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
@@ -487,6 +487,7 @@ where
     for message in parse_inbound_text_messages(body)? {
         let command = parse_command(message.text());
         let reply = execute_command(store, command)?;
+        println!("{reply}");
         send_reply(message.sender().to_owned(), reply).await?;
     }
 
@@ -524,7 +525,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::commands::Command;
     use crate::config::{AppConfig, SecretString, TrmnlConfig, WhatsAppConfig};
 
     #[test]
@@ -743,11 +743,9 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            execute_command(&state.store, Command::ListEntries)
-                .expect("list command should execute"),
-            "1. milk"
-        );
+        let entries = state.store.list_entries().expect("entries should list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text(), "milk");
     }
 
     #[tokio::test]
@@ -820,17 +818,26 @@ mod tests {
         assert_eq!(
             sent_replies,
             [
-                ("15550000001".to_owned(), "Added: milk".to_owned()),
-                ("15550000002".to_owned(), "Added: eggs".to_owned()),
-                ("15550000001".to_owned(), "1. milk\n2. eggs".to_owned()),
-                ("15550000002".to_owned(), "Removed: milk".to_owned()),
+                (
+                    "15550000001".to_owned(),
+                    "\"milk\" added to list.".to_owned()
+                ),
+                (
+                    "15550000002".to_owned(),
+                    "\"eggs\" added to list.".to_owned()
+                ),
+                (
+                    "15550000001".to_owned(),
+                    "\"milk\" removed from list.".to_owned()
+                ),
+                (
+                    "15550000002".to_owned(),
+                    "\"eggs\" removed from list.".to_owned()
+                ),
             ]
         );
-        assert_eq!(
-            execute_command(&state.store, Command::ListEntries)
-                .expect("list command should execute"),
-            "1. eggs"
-        );
+        let entries = state.store.list_entries().expect("entries should list");
+        assert!(entries.is_empty());
     }
 
     #[tokio::test]
@@ -851,10 +858,12 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert!(sent_replies.is_empty());
-        assert_eq!(
-            execute_command(&state.store, Command::ListEntries)
-                .expect("list command should execute"),
-            "The list is empty."
+        assert!(
+            state
+                .store
+                .list_entries()
+                .expect("entries should list")
+                .is_empty()
         );
     }
 
@@ -915,13 +924,13 @@ mod tests {
                                         "from": "15550000001",
                                         "id": "wamid.third",
                                         "type": "text",
-                                        "text": { "body": "list" }
+                                        "text": { "body": "milk" }
                                     },
                                     {
                                         "from": "15550000002",
                                         "id": "wamid.fourth",
                                         "type": "text",
-                                        "text": { "body": "remove 1" }
+                                        "text": { "body": "eggs" }
                                     }
                                 ]
                             }

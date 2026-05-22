@@ -1,8 +1,8 @@
 # TRMNL WhatsApp List
 
 `trmnl-whatsapp-list` is a small Rust 2024 service for one shared SQLite-backed
-text list. WhatsApp messages mutate or query the list, and a TRMNL device in
-BYOS mode displays the current list.
+text list. WhatsApp messages toggle list entries, and a TRMNL device in BYOS
+mode displays the current list.
 
 The project intentionally stays narrow: one shared list, direct SQLite startup
 initialization, official Meta WhatsApp Cloud API integration, and no migration,
@@ -15,11 +15,12 @@ Implemented:
 - Runtime configuration from environment variables.
 - Axum startup that binds `BIND_ADDR` and serves the router.
 - SQLite `entries` table initialization and list operations.
-- Command parsing and execution for add, list, remove, clear, and help.
+- Message text toggling that adds missing entries and removes existing entries.
+- Slash commands for `/list` and `/clear`.
 - WhatsApp webhook verification for `GET /webhooks/whatsapp`.
 - WhatsApp payload parsing for inbound text messages.
 - Meta Graph API text reply client.
-- WhatsApp command execution and replies for `POST /webhooks/whatsapp`.
+- WhatsApp list updates and replies for `POST /webhooks/whatsapp`.
 - TRMNL BYOS display metadata at `GET /api/display`.
 - TRMNL list PNG rendering at `GET /trmnl/list.png`.
 - TRMNL telemetry acceptance at `POST /api/log`.
@@ -97,6 +98,24 @@ cargo run
 The service loads configuration, initializes the SQLite database, builds the
 Axum router, binds `BIND_ADDR`, and serves requests until stopped.
 
+## Local Webhook Exercise
+
+With the server running locally, send a sample inbound WhatsApp text webhook:
+
+```sh
+scripts/send-local-whatsapp-webhook.sh
+```
+
+The script posts to `http://127.0.0.1:3000/webhooks/whatsapp` by default. Pass a
+base URL to target a different local bind address:
+
+```sh
+scripts/send-local-whatsapp-webhook.sh http://127.0.0.1:4000
+```
+
+The webhook handler sends a WhatsApp reply through Meta as part of normal
+processing, so a local run still depends on the configured Meta credentials.
+
 ## Check
 
 Required verification commands:
@@ -119,8 +138,8 @@ RUSTC_WRAPPER= cargo nextest run
 
 - `GET /webhooks/whatsapp`: verifies Meta's `hub.verify_token` and returns
   `hub.challenge` on a match.
-- `POST /webhooks/whatsapp`: parses inbound WhatsApp text messages, executes
-  list commands, and replies through the Meta Graph API.
+- `POST /webhooks/whatsapp`: parses inbound WhatsApp text messages, toggles the
+  matching list entry, and replies through the Meta Graph API.
 - `GET /api/display?token=...`: returns a TRMNL BYOS display response whose
   image URL points at `/trmnl/list.png?token=...`.
 - `GET /trmnl/list.png?token=...`: renders the current list as an 800x480 PNG.

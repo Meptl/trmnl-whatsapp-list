@@ -6,14 +6,15 @@ The service owns one shared text list. It does not model users, per-chat lists,
 grocery-specific concepts, permissions beyond shared endpoint tokens, or
 cross-provider transport abstractions.
 
-Plain unrecognized WhatsApp text is treated as an entry to add. Explicit command
-text is reserved for list operations:
+Non-empty WhatsApp text is treated as a list entry toggle by default. If the
+trimmed text is not present, it is added. If it is already present, it is
+removed. Matching uses exact text first, then case-insensitive text if no exact
+match exists.
 
-- `list`
-- `remove <text>`
-- `remove <number>`
-- `clear`
-- `help`
+Slash commands are reserved for list operations:
+
+- `/list`
+- `/clear`
 
 ## Persistence
 
@@ -30,12 +31,12 @@ User-facing numeric positions are 1-based indexes into that ordered list.
 
 ## Boundaries
 
-Command parsing and execution are independent of WhatsApp payloads and HTTP
-handlers. Command execution depends on the store boundary and returns reply text
+Message interpretation and execution are independent of WhatsApp payloads and
+HTTP handlers. Execution depends on the store boundary and returns reply text
 that a transport can send.
 
 Persistence owns exact storage and deterministic list mutations. Text trimming
-and command interpretation belong outside the store.
+and message interpretation belong outside the store.
 
 WhatsApp payload parsing owns Meta webhook JSON shape only. It extracts inbound
 text messages and ignores unsupported non-text or status-only payloads.
@@ -44,7 +45,7 @@ The reply client owns Meta Graph API request construction and sending. The app
 does not provide a provider fallback or an alternate WhatsApp transport.
 
 HTTP handlers own route-level behavior and should compose configuration, store,
-command execution, payload parsing, and transport clients without moving domain
+message execution, payload parsing, and transport clients without moving domain
 rules into Axum-specific code.
 
 ## TRMNL BYOS
@@ -62,7 +63,7 @@ TRMNL display and image endpoints require the shared `TRMNL_TOKEN`.
 
 ## Compatibility
 
-Do not add fallback methods, provider compatibility layers, legacy command
-aliases, or backward-compatibility paths unless the user explicitly requests
-them. Prefer replacing incomplete approaches with the intended implementation
-over supporting both old and new behavior.
+Do not add fallback methods, provider compatibility layers, legacy aliases, or
+backward-compatibility paths unless the user explicitly requests them. Prefer
+replacing incomplete approaches with the intended implementation over
+supporting both old and new behavior.

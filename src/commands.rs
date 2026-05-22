@@ -5,18 +5,10 @@ use crate::store::{RemoveEntryResult, StoreError, StoreHandle};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
-    AddEntry(String),
+    ToggleEntry(String),
     ListEntries,
-    RemoveEntry(RemoveTarget),
     ClearEntries,
-    Help,
     Ignore,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RemoveTarget {
-    Position(usize),
-    Text(String),
 }
 
 pub fn execute_command(
@@ -24,12 +16,10 @@ pub fn execute_command(
     command: Command,
 ) -> Result<String, CommandExecutionError> {
     match command {
-        Command::AddEntry(text) => add_entry(store, text),
+        Command::ToggleEntry(text) => toggle_entry(store, text),
         Command::ListEntries => list_entries(store),
-        Command::RemoveEntry(target) => remove_entry(store, target),
         Command::ClearEntries => clear_entries(store),
-        Command::Help => Ok(help_reply()),
-        Command::Ignore => Ok("Nothing to do. Send help to see supported commands.".to_owned()),
+        Command::Ignore => Ok("Nothing to do. Send an item name to update the list.".to_owned()),
     }
 }
 
@@ -39,65 +29,30 @@ pub fn parse_command(message: &str) -> Command {
         return Command::Ignore;
     }
 
-    let Some((keyword, argument)) = split_first_token(trimmed) else {
-        return parse_exact_command(trimmed)
-            .unwrap_or_else(|| Command::AddEntry(trimmed.to_owned()));
-    };
-
-    if keyword.eq_ignore_ascii_case("remove") {
-        return parse_remove(argument);
+    if trimmed.eq_ignore_ascii_case("/list") {
+        return Command::ListEntries;
     }
 
-    Command::AddEntry(trimmed.to_owned())
-}
-
-fn parse_exact_command(message: &str) -> Option<Command> {
-    if message.eq_ignore_ascii_case("list") {
-        Some(Command::ListEntries)
-    } else if message.eq_ignore_ascii_case("clear") {
-        Some(Command::ClearEntries)
-    } else if message.eq_ignore_ascii_case("help") {
-        Some(Command::Help)
-    } else if message.eq_ignore_ascii_case("remove") {
-        Some(Command::Ignore)
-    } else {
-        None
-    }
-}
-
-fn parse_remove(argument: &str) -> Command {
-    let target = argument.trim();
-    if target.is_empty() {
-        return Command::Ignore;
+    if trimmed.eq_ignore_ascii_case("/clear") {
+        return Command::ClearEntries;
     }
 
-    let remove_target = target
-        .parse::<usize>()
-        .ok()
-        .filter(|position| *position > 0)
-        .map_or_else(
-            || RemoveTarget::Text(target.to_owned()),
-            RemoveTarget::Position,
-        );
-
-    Command::RemoveEntry(remove_target)
+    Command::ToggleEntry(trimmed.to_owned())
 }
 
-fn split_first_token(message: &str) -> Option<(&str, &str)> {
-    let index = message.find(char::is_whitespace)?;
-
-    Some((&message[..index], &message[index..]))
-}
-
-fn add_entry(store: &StoreHandle, text: String) -> Result<String, CommandExecutionError> {
+fn toggle_entry(store: &StoreHandle, text: String) -> Result<String, CommandExecutionError> {
     let entry_text = text.trim();
     if entry_text.is_empty() {
-        return Ok("Nothing to add. Send help to see supported commands.".to_owned());
+        return Ok("Nothing to do. Send an item name to update the list.".to_owned());
     }
 
-    let entry = store.add_entry(entry_text)?;
-
-    Ok(format!("Added: {}", entry.text()))
+    match store.remove_entry_by_text(entry_text)? {
+        RemoveEntryResult::Removed(entry) => Ok(format!("\"{}\" removed from list.", entry.text())),
+        RemoveEntryResult::NotFound => {
+            let entry = store.add_entry(entry_text)?;
+            Ok(format!("\"{}\" added to list.", entry.text()))
+        }
+    }
 }
 
 fn list_entries(store: &StoreHandle) -> Result<String, CommandExecutionError> {
@@ -115,49 +70,10 @@ fn list_entries(store: &StoreHandle) -> Result<String, CommandExecutionError> {
         .join("\n"))
 }
 
-fn remove_entry(
-    store: &StoreHandle,
-    target: RemoveTarget,
-) -> Result<String, CommandExecutionError> {
-    match target {
-        RemoveTarget::Position(position) => {
-            let result = store.remove_entry_by_position(position)?;
-            Ok(format_remove_result(
-                result,
-                &format!("position {position}"),
-            ))
-        }
-        RemoveTarget::Text(text) => {
-            let result = store.remove_entry_by_text(text.trim())?;
-            Ok(format_remove_result(result, text.trim()))
-        }
-    }
-}
-
-fn format_remove_result(result: RemoveEntryResult, target_description: &str) -> String {
-    match result {
-        RemoveEntryResult::Removed(entry) => format!("Removed: {}", entry.text()),
-        RemoveEntryResult::NotFound => format!("Not found: {target_description}"),
-    }
-}
-
 fn clear_entries(store: &StoreHandle) -> Result<String, CommandExecutionError> {
     let result = store.clear_entries()?;
 
     Ok(format!("Cleared {} entries.", result.deleted_count()))
-}
-
-fn help_reply() -> String {
-    [
-        "Supported commands:",
-        "- plain text: add an entry",
-        "- list: show all entries",
-        "- remove <text>: remove a matching entry",
-        "- remove <number>: remove by list position",
-        "- clear: remove all entries",
-        "- help: show this help",
-    ]
-    .join("\n")
 }
 
 #[derive(Debug)]
@@ -197,10 +113,10 @@ mod tests {
     use crate::store::StoreHandle;
 
     #[test]
-    fn plain_non_command_text_adds_trimmed_entry() {
+    fn plain_text_toggles_trimmed_entry() {
         assert_eq!(
             parse_command("  Buy Milk Tomorrow  "),
-            Command::AddEntry("Buy Milk Tomorrow".to_owned())
+            Command::ToggleEntry("Buy Milk Tomorrow".to_owned())
         );
     }
 
@@ -211,78 +127,70 @@ mod tests {
     }
 
     #[test]
-    fn exact_commands_are_case_insensitive() {
-        assert_eq!(parse_command("LIST"), Command::ListEntries);
-        assert_eq!(parse_command("Clear"), Command::ClearEntries);
-        assert_eq!(parse_command("hElP"), Command::Help);
-    }
-
-    #[test]
-    fn commands_with_extra_words_are_added_as_text_except_remove() {
+    fn former_command_words_are_item_text() {
         assert_eq!(
-            parse_command("list groceries"),
-            Command::AddEntry("list groceries".to_owned())
+            parse_command("LIST"),
+            Command::ToggleEntry("LIST".to_owned())
         );
         assert_eq!(
-            parse_command("help me"),
-            Command::AddEntry("help me".to_owned())
+            parse_command("Clear"),
+            Command::ToggleEntry("Clear".to_owned())
         );
-    }
-
-    #[test]
-    fn remove_text_argument_is_trimmed_and_casing_is_preserved() {
         assert_eq!(
-            parse_command("  ReMoVe   Fresh Milk  "),
-            Command::RemoveEntry(RemoveTarget::Text("Fresh Milk".to_owned()))
+            parse_command("hElP"),
+            Command::ToggleEntry("hElP".to_owned())
+        );
+        assert_eq!(
+            parse_command("remove milk"),
+            Command::ToggleEntry("remove milk".to_owned())
         );
     }
 
     #[test]
-    fn remove_positive_integer_argument_targets_display_position() {
-        assert_eq!(
-            parse_command("remove 2"),
-            Command::RemoveEntry(RemoveTarget::Position(2))
-        );
-        assert_eq!(
-            parse_command("REMOVE 0012"),
-            Command::RemoveEntry(RemoveTarget::Position(12))
-        );
+    fn slash_commands_are_case_insensitive() {
+        assert_eq!(parse_command("/LIST"), Command::ListEntries);
+        assert_eq!(parse_command(" /clear "), Command::ClearEntries);
     }
 
     #[test]
-    fn remove_non_positive_or_non_integer_argument_targets_text() {
-        assert_eq!(
-            parse_command("remove 0"),
-            Command::RemoveEntry(RemoveTarget::Text("0".to_owned()))
-        );
-        assert_eq!(
-            parse_command("remove -2"),
-            Command::RemoveEntry(RemoveTarget::Text("-2".to_owned()))
-        );
-        assert_eq!(
-            parse_command("remove 2.0"),
-            Command::RemoveEntry(RemoveTarget::Text("2.0".to_owned()))
-        );
-    }
-
-    #[test]
-    fn remove_without_target_is_ignored() {
-        assert_eq!(parse_command("remove"), Command::Ignore);
-        assert_eq!(parse_command(" remove   "), Command::Ignore);
-    }
-
-    #[test]
-    fn execute_add_then_list_shows_one_based_item() {
-        let database = TestDatabase::new("execute_add_list");
+    fn execute_new_text_adds_item() {
+        let database = TestDatabase::new("execute_toggle_add");
         let store = initialized_store(&database);
 
-        let add_reply =
-            execute_command(&store, parse_command("milk")).expect("add command should execute");
-        let list_reply =
-            execute_command(&store, Command::ListEntries).expect("list command should execute");
+        let reply =
+            execute_command(&store, parse_command("milk")).expect("toggle command should execute");
+        let entries = store.list_entries().expect("entries should list");
 
-        assert_eq!(add_reply, "Added: milk");
-        assert_eq!(list_reply, "1. milk");
+        assert_eq!(reply, "\"milk\" added to list.");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text(), "milk");
+    }
+
+    #[test]
+    fn execute_existing_text_removes_item() {
+        let database = TestDatabase::new("execute_toggle_remove");
+        let store = initialized_store(&database);
+        execute_command(&store, parse_command("milk")).expect("toggle add should execute");
+
+        let reply =
+            execute_command(&store, parse_command("MILK")).expect("toggle command should execute");
+        let entries = store.list_entries().expect("entries should list");
+
+        assert_eq!(reply, "\"milk\" removed from list.");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn execute_list_returns_numbered_entries() {
+        let database = TestDatabase::new("execute_list");
+        let store = initialized_store(&database);
+        execute_command(&store, parse_command("milk")).expect("first toggle should execute");
+        execute_command(&store, parse_command("eggs")).expect("second toggle should execute");
+
+        let reply =
+            execute_command(&store, parse_command("/list")).expect("list command should execute");
+
+        assert_eq!(reply, "1. milk\n2. eggs");
     }
 
     #[test]
@@ -291,71 +199,24 @@ mod tests {
         let store = initialized_store(&database);
 
         let reply =
-            execute_command(&store, Command::ListEntries).expect("list command should execute");
+            execute_command(&store, parse_command("/list")).expect("list command should execute");
 
         assert_eq!(reply, "The list is empty.");
     }
 
     #[test]
-    fn execute_remove_by_text_reports_success_and_not_found() {
-        let database = TestDatabase::new("execute_remove_text");
-        let store = initialized_store(&database);
-        execute_command(&store, parse_command("milk")).expect("add command should execute");
-
-        let removed = execute_command(&store, parse_command("remove milk"))
-            .expect("remove command should execute");
-        let not_found = execute_command(&store, parse_command("remove milk"))
-            .expect("remove command should execute");
-
-        assert_eq!(removed, "Removed: milk");
-        assert_eq!(not_found, "Not found: milk");
-    }
-
-    #[test]
-    fn execute_remove_by_number_uses_list_numbering() {
-        let database = TestDatabase::new("execute_remove_number");
-        let store = initialized_store(&database);
-        execute_command(&store, parse_command("first")).expect("first add should execute");
-        execute_command(&store, parse_command("second")).expect("second add should execute");
-
-        let removed = execute_command(&store, parse_command("remove 2"))
-            .expect("remove command should execute");
-        let list_reply =
-            execute_command(&store, Command::ListEntries).expect("list command should execute");
-
-        assert_eq!(removed, "Removed: second");
-        assert_eq!(list_reply, "1. first");
-    }
-
-    #[test]
-    fn execute_clear_reply_reflects_deleted_count() {
+    fn execute_clear_removes_entries() {
         let database = TestDatabase::new("execute_clear");
         let store = initialized_store(&database);
-        execute_command(&store, parse_command("first")).expect("first add should execute");
-        execute_command(&store, parse_command("second")).expect("second add should execute");
+        execute_command(&store, parse_command("milk")).expect("first toggle should execute");
+        execute_command(&store, parse_command("eggs")).expect("second toggle should execute");
 
         let reply =
-            execute_command(&store, Command::ClearEntries).expect("clear command should execute");
-        let list_reply =
-            execute_command(&store, Command::ListEntries).expect("list command should execute");
+            execute_command(&store, parse_command("/clear")).expect("clear command should execute");
+        let entries = store.list_entries().expect("entries should list");
 
         assert_eq!(reply, "Cleared 2 entries.");
-        assert_eq!(list_reply, "The list is empty.");
-    }
-
-    #[test]
-    fn execute_help_lists_supported_commands() {
-        let database = TestDatabase::new("execute_help");
-        let store = initialized_store(&database);
-
-        let reply = execute_command(&store, Command::Help).expect("help command should execute");
-
-        assert!(reply.contains("plain text"));
-        assert!(reply.contains("list"));
-        assert!(reply.contains("remove <text>"));
-        assert!(reply.contains("remove <number>"));
-        assert!(reply.contains("clear"));
-        assert!(reply.contains("help"));
+        assert!(entries.is_empty());
     }
 
     #[test]
@@ -365,11 +226,13 @@ mod tests {
 
         let reply =
             execute_command(&store, Command::Ignore).expect("ignore command should execute");
-        let list_reply =
-            execute_command(&store, Command::ListEntries).expect("list command should execute");
+        let entries = store.list_entries().expect("entries should list");
 
-        assert_eq!(reply, "Nothing to do. Send help to see supported commands.");
-        assert_eq!(list_reply, "The list is empty.");
+        assert_eq!(
+            reply,
+            "Nothing to do. Send an item name to update the list."
+        );
+        assert!(entries.is_empty());
     }
 
     fn initialized_store(database: &TestDatabase) -> StoreHandle {

@@ -3,8 +3,8 @@
 ## Purpose
 
 `trmnl-whatsapp-list` is a small Rust 2024 service for one shared list of text
-entries. It is designed so WhatsApp messages mutate or query the list, and a
-TRMNL device in BYOS mode displays the current list.
+entries. It is designed so WhatsApp messages toggle list entries, and a TRMNL
+device in BYOS mode displays the current list.
 
 The service intentionally avoids migrations, multi-list modeling, provider
 fallbacks, and backward compatibility layers.
@@ -21,8 +21,8 @@ The implemented foundation currently includes:
 - Router for WhatsApp and TRMNL endpoints.
 - WhatsApp verification for `GET /webhooks/whatsapp`.
 - SQLite persistence initialization and list operations.
-- Command parsing and execution for add, list, remove, clear, help, and ignored
-  empty input.
+- Message text toggling for add/remove behavior, slash commands for list and
+  clear, and ignored empty input.
 - WhatsApp Cloud API webhook payload parsing for inbound text messages.
 - Meta Graph API text reply request construction and sending through the
   WhatsApp webhook POST flow.
@@ -65,7 +65,7 @@ The service is split into these responsibilities:
   reply client.
 - Persistence uses `rusqlite` directly against `DATABASE_PATH` and initializes
   the schema with `CREATE TABLE IF NOT EXISTS`.
-- Command parsing and execution stay independent of WhatsApp payload shapes,
+- Message interpretation and execution stay independent of WhatsApp payload shapes,
   Meta transport, and HTTP handlers.
 - WhatsApp integration targets the official Meta WhatsApp Cloud API only.
 - TRMNL integration exposes BYOS display, PNG image, and telemetry endpoints.
@@ -90,7 +90,7 @@ The store operations are:
 - remove by displayed numeric position
 - clear all entries
 
-Text is stored exactly as supplied to the store; command execution owns trimming
+Text is stored exactly as supplied to the store; message execution owns trimming
 and validation.
 
 ## HTTP Surface
@@ -110,8 +110,8 @@ WhatsApp verification compares Meta's `hub.verify_token` against
 Handler behavior:
 
 - `GET /webhooks/whatsapp` verifies Meta's challenge.
-- `POST /webhooks/whatsapp` parses inbound text messages, executes commands,
-  and sends replies.
+- `POST /webhooks/whatsapp` parses inbound text messages, toggles matching list
+  entries, logs reply text, and sends replies.
 - `GET /api/display` returns a TRMNL display response containing the list PNG
   URL.
 - `GET /trmnl/list.png` renders the current list as an 800x480 PNG.
@@ -123,7 +123,7 @@ Handler behavior:
 WhatsApp payload parsing accepts Meta webhook JSON and extracts inbound text
 messages with sender, message id, and text body. Non-text messages, status-only
 payloads, incomplete text messages, and unsupported top-level shapes do not
-produce commands.
+produce list changes.
 
 The reply client targets:
 
@@ -132,18 +132,22 @@ The reply client targets:
 It sends text replies with bearer authentication from `WHATSAPP_ACCESS_TOKEN`.
 Debug output intentionally omits the access token.
 
-## Command Behavior
+## Message Behavior
 
-Supported commands are:
+Non-empty inbound text toggles the matching list entry:
 
-- plain non-empty text: add a trimmed entry
-- `list`: return entries in display order
-- `remove <text>`: remove a matching entry
-- `remove <number>`: remove by 1-based displayed position
-- `clear`: remove all entries
-- `help`: return supported commands
+- if the trimmed text is absent, add it and reply `"text" added to list.`
+- if the trimmed text is present, remove it and reply `"text" removed from list.`
 
-Empty input and `remove` without a target are ignored with a no-op reply.
+Matching uses exact text first, then case-insensitive text if no exact match
+exists.
+
+Supported slash commands are:
+
+- `/list`: return entries in display order
+- `/clear`: remove all entries
+
+Empty input is ignored with a no-op reply.
 
 ## Verification Expectations
 
