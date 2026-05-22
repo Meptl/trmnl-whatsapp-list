@@ -1,7 +1,7 @@
-use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use serde::Deserialize;
 
 use crate::app::AppState;
@@ -94,11 +94,16 @@ fn whatsapp_webhook_status(result: Result<(), WhatsAppWebhookError>) -> StatusCo
 async fn trmnl_display(
     State(state): State<AppState>,
     Query(query): Query<TrmnlTokenQuery>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<trmnl::DisplayResponse>, StatusCode> {
     acknowledge_state_shape(&state);
-    validate_trmnl_token(&state, query)?;
+    let token = validate_trmnl_token(&state, query)?;
+    let encoded_token = percent_encode_query_component(&token);
+    let image_url = format!(
+        "{}/trmnl/list.png?token={encoded_token}",
+        state.config.public_base_url
+    );
 
-    Ok(StatusCode::NOT_IMPLEMENTED)
+    Ok(Json(trmnl::DisplayResponse::new(image_url, "list.png")))
 }
 
 async fn trmnl_image(
@@ -121,11 +126,28 @@ fn acknowledge_state_shape(state: &AppState) {
     let _ = (&state.config, &state.store, &state.whatsapp_client);
 }
 
-fn validate_trmnl_token(state: &AppState, query: TrmnlTokenQuery) -> Result<(), StatusCode> {
+fn validate_trmnl_token(state: &AppState, query: TrmnlTokenQuery) -> Result<String, StatusCode> {
     match query.token {
-        Some(token) if token == state.config.trmnl.token.as_str() => Ok(()),
+        Some(token) if token == state.config.trmnl.token.as_str() => Ok(token),
         _ => Err(StatusCode::FORBIDDEN),
     }
+}
+
+fn percent_encode_query_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        }
+    }
+
+    encoded
 }
 
 async fn process_whatsapp_webhook<SendReply, SendReplyFuture>(
@@ -235,19 +257,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trmnl_display_returns_image_response_for_valid_token() {
+        let state = AppState::new_uninitialized(test_config());
+
+        let Json(response) = trmnl_display(
+            State(state),
+            Query(TrmnlTokenQuery {
+                token: Some("trmnl-secret".to_owned()),
+            }),
+        )
+        .await
+        .expect("valid token should return display response");
+        let json = serde_json::to_value(response).expect("display response should serialize");
+
+        assert_eq!(json["status"], 0);
+        assert_eq!(
+            json["image_url"],
+            "https://example.test/trmnl/list.png?token=trmnl-secret"
+        );
+        assert_eq!(json["filename"], "list.png");
+    }
+
+    #[tokio::test]
+    async fn trmnl_display_percent_encodes_reserved_token_in_image_url() {
+        let token = "trmnl&secret+value#part=1";
+        let mut config = test_config();
+        config.trmnl.token = SecretString::from_test_value(token);
+        let state = AppState::new_uninitialized(config);
+
+        let Json(response) = trmnl_display(
+            State(state),
+            Query(TrmnlTokenQuery {
+                token: Some(token.to_owned()),
+            }),
+        )
+        .await
+        .expect("valid token should return display response");
+        let json = serde_json::to_value(response).expect("display response should serialize");
+
+        assert_eq!(
+            json["image_url"],
+            "https://example.test/trmnl/list.png?token=trmnl%26secret%2Bvalue%23part%3D1"
+        );
+    }
+
+    #[tokio::test]
     async fn placeholder_handlers_do_not_return_success() {
         let state = AppState::new_uninitialized(test_config());
 
-        assert_eq!(
-            trmnl_display(
-                State(state.clone()),
-                Query(TrmnlTokenQuery {
-                    token: Some("trmnl-secret".to_owned()),
-                }),
-            )
-            .await,
-            Ok(StatusCode::NOT_IMPLEMENTED)
-        );
         assert_eq!(
             trmnl_image(
                 State(state.clone()),
@@ -265,7 +322,7 @@ mod tests {
     async fn trmnl_display_rejects_wrong_or_missing_token() {
         let state = AppState::new_uninitialized(test_config());
 
-        assert_eq!(
+        assert!(matches!(
             trmnl_display(
                 State(state.clone()),
                 Query(TrmnlTokenQuery {
@@ -274,11 +331,11 @@ mod tests {
             )
             .await,
             Err(StatusCode::FORBIDDEN)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             trmnl_display(State(state), Query(TrmnlTokenQuery { token: None })).await,
             Err(StatusCode::FORBIDDEN)
-        );
+        ));
     }
 
     #[tokio::test]
