@@ -22,6 +22,9 @@ async fn run() -> Result<(), StartupError> {
     let bind_addr = config.bind_addr.clone();
     let router = build_router_from_config(config)?;
     let listener = TcpListener::bind(&bind_addr).await?;
+    let local_addr = listener.local_addr()?;
+
+    println!("Listening on http://{local_addr}");
 
     axum::serve(listener, router).await?;
 

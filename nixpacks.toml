@@ -1,0 +1,9 @@
+[phases.build]
+cmds = [
+    "cargo build --release",
+    "mkdir -p /app/bin",
+    "cp target/release/trmnl-whatsapp-list /app/bin/trmnl-whatsapp-list",
+]
+
+[start]
+cmd = "/app/bin/trmnl-whatsapp-list"
