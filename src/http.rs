@@ -89,10 +89,6 @@ fn whatsapp_webhook_status(result: Result<(), WhatsAppWebhookError>) -> StatusCo
             eprintln!("Failed to update list from WhatsApp webhook: {error}");
             StatusCode::INTERNAL_SERVER_ERROR
         }
-        Err(WhatsAppWebhookError::Reply(error)) => {
-            eprintln!("Failed to send WhatsApp reply: {error}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
     }
 }
 
@@ -488,7 +484,9 @@ where
         let command = parse_command(message.text());
         let reply = execute_command(store, command)?;
         println!("{reply}");
-        send_reply(message.sender().to_owned(), reply).await?;
+        if let Err(error) = send_reply(message.sender().to_owned(), reply).await {
+            eprintln!("Failed to send WhatsApp reply: {error}");
+        }
     }
 
     Ok(())
@@ -498,7 +496,6 @@ where
 enum WhatsAppWebhookError {
     Payload(WhatsAppPayloadError),
     Command(CommandExecutionError),
-    Reply(WhatsAppReplyError),
 }
 
 impl From<WhatsAppPayloadError> for WhatsAppWebhookError {
@@ -510,12 +507,6 @@ impl From<WhatsAppPayloadError> for WhatsAppWebhookError {
 impl From<CommandExecutionError> for WhatsAppWebhookError {
     fn from(error: CommandExecutionError) -> Self {
         Self::Command(error)
-    }
-}
-
-impl From<WhatsAppReplyError> for WhatsAppWebhookError {
-    fn from(error: WhatsAppReplyError) -> Self {
-        Self::Reply(error)
     }
 }
 
@@ -841,6 +832,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn whatsapp_webhook_acknowledges_processed_message_when_reply_fails() {
+        let database = TestDatabase::new("webhook_acknowledges_reply_failure");
+        let state = initialized_state(&database);
+        let mut reply_attempts = 0;
+
+        let status = whatsapp_webhook_with_reply_sender(
+            State(state.clone()),
+            single_message_payload("15550000001", "Cow").to_owned(),
+            |_sender, _reply| {
+                reply_attempts += 1;
+                async { Err(request_build_reply_error()) }
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reply_attempts, 1);
+        let entries = state.store.list_entries().expect("entries should list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text(), "Cow");
+    }
+
+    #[tokio::test]
     async fn whatsapp_webhook_ignores_status_and_non_text_payloads() {
         let database = TestDatabase::new("webhook_ignores_non_text");
         let state = initialized_state(&database);
@@ -939,6 +953,42 @@ mod tests {
                 }
             ]
         }"#
+    }
+
+    fn single_message_payload(sender: &str, text: &str) -> String {
+        format!(
+            r#"{{
+                "entry": [
+                    {{
+                        "changes": [
+                            {{
+                                "value": {{
+                                    "messages": [
+                                        {{
+                                            "from": "{sender}",
+                                            "id": "wamid.single",
+                                            "text": {{
+                                                "body": "{text}"
+                                            }},
+                                            "type": "text"
+                                        }}
+                                    ]
+                                }}
+                            }}
+                        ]
+                    }}
+                ]
+            }}"#
+        )
+    }
+
+    fn request_build_reply_error() -> WhatsAppReplyError {
+        let error = reqwest::Client::new()
+            .get("http://")
+            .build()
+            .expect_err("invalid URL should fail request construction");
+
+        WhatsAppReplyError::RequestBuild(error)
     }
 
     fn status_and_non_text_payload() -> &'static str {
