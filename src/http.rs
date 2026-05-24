@@ -1232,13 +1232,31 @@ mod tests {
             State(state),
             valid_trmnl_headers(),
             r#"{
-                "device": "trmnl",
-                "battery_voltage": 4.12,
-                "wifi_signal": -61,
-                "refresh_rate": 900,
-                "firmware_version": "1.0.0"
+                "logMessage": "Display refresh failed",
+                "deviceStatusStamp": "2026-05-24T16:45:00Z",
+                "firmwareVersion": "1.8.2",
+                "batteryVoltage": 4.12,
+                "rssi": -61,
+                "extraFirmwareField": {
+                    "refreshRate": 900,
+                    "retryCount": 1
+                }
             }"#
             .to_owned(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn trmnl_log_accepts_valid_json_without_optional_firmware_fields() {
+        let state = AppState::new_uninitialized(test_config());
+
+        let status = trmnl_log(
+            State(state),
+            valid_trmnl_headers(),
+            r#"{"logMessage":"Display refresh completed"}"#.to_owned(),
         )
         .await;
 
@@ -1254,7 +1272,8 @@ mod tests {
         let status = trmnl_log(
             State(state.clone()),
             valid_trmnl_headers(),
-            r#"{"device":"trmnl","event":"refresh"}"#.to_owned(),
+            r#"{"logMessage":"Display refresh completed","deviceStatusStamp":"2026-05-24T16:45:00Z"}"#
+                .to_owned(),
         )
         .await;
 
