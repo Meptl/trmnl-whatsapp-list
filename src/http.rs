@@ -729,7 +729,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use axum::http::HeaderValue;
+    use axum::http::{HeaderValue, Method};
+    use axum::response::IntoResponse;
 
     use super::*;
     use crate::config::{AppConfig, SecretString, TrmnlConfig, WhatsAppConfig};
@@ -741,6 +742,77 @@ mod tests {
         let app = router(state);
 
         assert!(app.has_routes());
+    }
+
+    #[tokio::test]
+    async fn trmnl_firmware_flow_accepts_setup_display_image_and_log_requests() {
+        let database = TestDatabase::new("trmnl_firmware_flow");
+        let state = initialized_state(&database);
+        state.store.add_entry("milk").expect("entry should insert");
+        let app = router(state.clone());
+
+        assert!(app.has_routes());
+
+        let device_id = "AA:BB:CC:DD:EE:FF";
+        let setup_response = call_trmnl_route_like(
+            state.clone(),
+            Method::GET,
+            "/api/setup",
+            trmnl_headers_with_id(device_id),
+            String::new(),
+        )
+        .await;
+        let setup_json = response_json(setup_response, StatusCode::OK).await;
+        let api_key = setup_json
+            .get("api_key")
+            .and_then(serde_json::Value::as_str)
+            .expect("setup response should include api_key");
+
+        assert_eq!(api_key, "trmnl-secret");
+
+        let firmware_headers = trmnl_headers_with_id_and_access_token(device_id, api_key);
+        let display_response = call_trmnl_route_like(
+            state.clone(),
+            Method::GET,
+            "/api/display",
+            firmware_headers.clone(),
+            String::new(),
+        )
+        .await;
+        let display_json = response_json(display_response, StatusCode::OK).await;
+        let image_url = display_json
+            .get("image_url")
+            .and_then(serde_json::Value::as_str)
+            .expect("display response should include image_url");
+        let filename = display_json
+            .get("filename")
+            .and_then(serde_json::Value::as_str)
+            .expect("display response should include filename");
+
+        assert_eq!(image_url, "https://example.test/trmnl/list.png");
+        assert_firmware_safe_filename(filename);
+
+        assert_returned_image_url_fetches_png(state.clone(), image_url, firmware_headers.clone())
+            .await;
+
+        let log_response = call_trmnl_route_like(
+            state,
+            Method::POST,
+            "/api/log",
+            firmware_headers,
+            r#"{
+                "logMessage": "Display refresh completed",
+                "deviceStatusStamp": "2026-05-24T16:45:00Z",
+                "firmwareVersion": "1.8.2",
+                "batteryVoltage": 4.12,
+                "rssi": -61,
+                "refreshRate": 900
+            }"#
+            .to_owned(),
+        )
+        .await;
+
+        assert_eq!(log_response.status(), StatusCode::OK);
     }
 
     #[test]
@@ -1156,6 +1228,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trmnl_display_rejects_query_token_only_route_request() {
+        let state = AppState::new_uninitialized(test_config());
+
+        let response = call_trmnl_route_like(
+            state,
+            Method::GET,
+            "/api/display?token=trmnl-secret",
+            trmnl_headers_with_id("device-123"),
+            String::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn trmnl_image_returns_png_for_valid_firmware_headers() {
         let database = TestDatabase::new("trmnl_image_png");
         let state = initialized_state(&database);
@@ -1533,11 +1621,72 @@ mod tests {
         assert_eq!(url.query(), None);
 
         match url.path() {
-            "/trmnl/list.png" => trmnl_image(State(state), firmware_headers)
+            "/trmnl/list.png" => {
+                call_trmnl_route_like(
+                    state,
+                    Method::GET,
+                    url.path(),
+                    firmware_headers,
+                    String::new(),
+                )
                 .await
-                .expect("returned image URL path should fetch with firmware headers"),
+            }
             path => panic!("unexpected returned image URL path: {path}"),
         }
+    }
+
+    async fn response_json(response: Response, expected_status: StatusCode) -> serde_json::Value {
+        assert_eq!(response.status(), expected_status);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+
+        serde_json::from_slice(&bytes).expect("response body should parse as JSON")
+    }
+
+    async fn call_trmnl_route_like(
+        state: AppState,
+        method: Method,
+        target: &str,
+        headers: HeaderMap,
+        body: String,
+    ) -> Response {
+        let path = route_path(target);
+
+        if method == Method::GET && path == "/api/setup" {
+            return match trmnl_setup(State(state), headers).await {
+                Ok(response) => response.into_response(),
+                Err(status) => status.into_response(),
+            };
+        }
+        if method == Method::GET && path == "/api/display" {
+            return match trmnl_display(State(state), headers).await {
+                Ok(response) => response.into_response(),
+                Err(status) => status.into_response(),
+            };
+        }
+        if method == Method::GET && path == "/trmnl/list.png" {
+            return match trmnl_image(State(state), headers).await {
+                Ok(response) => response,
+                Err(status) => status.into_response(),
+            };
+        }
+        if method == Method::POST && path == "/api/log" {
+            return trmnl_log(State(state), headers, body).await.into_response();
+        }
+
+        if matches!(
+            path,
+            "/api/setup" | "/api/display" | "/trmnl/list.png" | "/api/log"
+        ) {
+            StatusCode::METHOD_NOT_ALLOWED.into_response()
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
+
+    fn route_path(target: &str) -> &str {
+        target.split_once('?').map_or(target, |(path, _query)| path)
     }
 
     fn trmnl_headers_with_id(device_id: &str) -> HeaderMap {
@@ -1550,7 +1699,11 @@ mod tests {
     }
 
     fn trmnl_headers_with_access_token(access_token: &str) -> HeaderMap {
-        let mut headers = trmnl_headers_with_id("device-123");
+        trmnl_headers_with_id_and_access_token("device-123", access_token)
+    }
+
+    fn trmnl_headers_with_id_and_access_token(device_id: &str, access_token: &str) -> HeaderMap {
+        let mut headers = trmnl_headers_with_id(device_id);
         headers.insert(
             "access-token",
             HeaderValue::from_str(access_token).expect("test access token should be valid"),
