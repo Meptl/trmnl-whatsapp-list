@@ -7,7 +7,7 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use image::ImageEncoder;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
 use crate::commands::{CommandExecutionError, execute_command, parse_command};
@@ -48,6 +48,31 @@ struct TrmnlFirmwareHeaders {
     update_source: Option<String>,
     temperature_profile: Option<String>,
     sensors: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TrmnlDisplayResponse {
+    status: u32,
+    image_url: String,
+    filename: String,
+    update_firmware: bool,
+    firmware_url: Option<String>,
+    refresh_rate: String,
+    reset_firmware: bool,
+}
+
+impl TrmnlDisplayResponse {
+    fn new(image_url: impl Into<String>, filename: impl Into<String>) -> Self {
+        Self {
+            status: 0,
+            image_url: image_url.into(),
+            filename: filename.into(),
+            update_firmware: false,
+            firmware_url: None,
+            refresh_rate: "60".to_owned(),
+            reset_firmware: false,
+        }
+    }
 }
 
 impl TrmnlFirmwareHeaders {
@@ -181,13 +206,13 @@ fn whatsapp_webhook_status(result: Result<(), WhatsAppWebhookError>) -> StatusCo
 async fn trmnl_display(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<trmnl::DisplayResponse>, StatusCode> {
+) -> Result<Json<TrmnlDisplayResponse>, StatusCode> {
     acknowledge_state_shape(&state);
     let firmware_headers = TrmnlFirmwareHeaders::from_headers(&headers)?;
     firmware_headers.validate_access_token(state.config.trmnl.token.as_str())?;
     let image_url = format!("{}/trmnl/list.png", state.config.public_base_url);
 
-    Ok(Json(trmnl::DisplayResponse::new(image_url, "list.png")))
+    Ok(Json(TrmnlDisplayResponse::new(image_url, "list.png")))
 }
 
 async fn trmnl_image(
@@ -784,9 +809,18 @@ mod tests {
             .expect("valid firmware headers should return display response");
         let json = serde_json::to_value(response).expect("display response should serialize");
 
-        assert_eq!(json["status"], 0);
-        assert_eq!(json["image_url"], "https://example.test/trmnl/list.png");
-        assert_eq!(json["filename"], "list.png");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "status": 0,
+                "image_url": "https://example.test/trmnl/list.png",
+                "filename": "list.png",
+                "update_firmware": false,
+                "firmware_url": null,
+                "refresh_rate": "60",
+                "reset_firmware": false,
+            })
+        );
     }
 
     #[tokio::test]
