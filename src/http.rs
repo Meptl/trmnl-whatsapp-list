@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
 use crate::commands::{CommandExecutionError, execute_command, parse_command};
-use crate::store::StoreHandle;
+use crate::store::{Entry, StoreHandle};
 use crate::whatsapp::{WhatsAppPayloadError, WhatsAppReplyError, parse_inbound_text_messages};
 
 pub fn router(state: AppState) -> Router {
@@ -237,12 +237,13 @@ async fn trmnl_setup(
     acknowledge_state_shape(&state);
     let firmware_headers = TrmnlFirmwareHeaders::from_headers(&headers)?;
     let image_url = format!("{}/trmnl/list.png", state.config.public_base_url);
+    let filename = trmnl_display_filename(&state.store)?;
 
     Ok(Json(TrmnlSetupResponse::new(
         state.config.trmnl.token.as_str(),
         trmnl_friendly_id(&firmware_headers.device_id),
         image_url,
-        "list.png",
+        filename,
     )))
 }
 
@@ -286,8 +287,48 @@ async fn trmnl_display(
     let firmware_headers = TrmnlFirmwareHeaders::from_headers(&headers)?;
     firmware_headers.validate_access_token(state.config.trmnl.token.as_str())?;
     let image_url = format!("{}/trmnl/list.png", state.config.public_base_url);
+    let filename = trmnl_display_filename(&state.store)?;
 
-    Ok(Json(TrmnlDisplayResponse::new(image_url, "list.png")))
+    Ok(Json(TrmnlDisplayResponse::new(image_url, filename)))
+}
+
+fn trmnl_display_filename(store: &StoreHandle) -> Result<String, StatusCode> {
+    let entries = store
+        .list_entries()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(trmnl_list_filename(&entries))
+}
+
+fn trmnl_list_filename(entries: &[Entry]) -> String {
+    if entries.is_empty() {
+        return "list-empty.png".to_owned();
+    }
+
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for entry in entries {
+        hash_filename_bytes(&mut hash, b"id");
+        hash_filename_bytes(&mut hash, &entry.id().to_be_bytes());
+        hash_filename_bytes(&mut hash, b"text");
+        hash_filename_field(&mut hash, entry.text().as_bytes());
+        hash_filename_bytes(&mut hash, b"created_at");
+        hash_filename_field(&mut hash, entry.created_at().as_bytes());
+    }
+
+    format!("list-{hash:016x}.png")
+}
+
+fn hash_filename_field(hash: &mut u64, bytes: &[u8]) {
+    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    hash_filename_bytes(hash, &length.to_be_bytes());
+    hash_filename_bytes(hash, bytes);
+}
+
+fn hash_filename_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
 }
 
 async fn trmnl_image(
@@ -877,7 +918,8 @@ mod tests {
 
     #[tokio::test]
     async fn trmnl_setup_returns_expected_setup_response_for_device_id() {
-        let state = AppState::new_uninitialized(test_config());
+        let database = TestDatabase::new("trmnl_setup_response");
+        let state = initialized_state(&database);
         let headers = trmnl_headers_with_id("AA:BB:CC:DD:EE:FF");
 
         let Json(response) = trmnl_setup(State(state), headers)
@@ -894,10 +936,11 @@ mod tests {
                 "api_key": "trmnl-secret",
                 "friendly_id": "trmnl-ddeeff",
                 "image_url": "https://example.test/trmnl/list.png",
-                "filename": "list.png",
+                "filename": "list-empty.png",
             })
         );
         assert_eq!(response.api_key, "trmnl-secret");
+        assert_firmware_safe_filename(&response.filename);
         assert!(!serialized.contains("verify-secret"));
         assert!(!serialized.contains("access-secret"));
     }
@@ -952,25 +995,27 @@ mod tests {
 
     #[tokio::test]
     async fn trmnl_display_returns_image_response_for_valid_firmware_headers() {
-        let state = AppState::new_uninitialized(test_config());
+        let database = TestDatabase::new("trmnl_display_response");
+        let state = initialized_state(&database);
 
         let Json(response) = trmnl_display(State(state), valid_trmnl_headers())
             .await
             .expect("valid firmware headers should return display response");
-        let json = serde_json::to_value(response).expect("display response should serialize");
+        let json = serde_json::to_value(&response).expect("display response should serialize");
 
         assert_eq!(
             json,
             serde_json::json!({
                 "status": 0,
                 "image_url": "https://example.test/trmnl/list.png",
-                "filename": "list.png",
+                "filename": "list-empty.png",
                 "update_firmware": false,
                 "firmware_url": null,
                 "refresh_rate": "60",
                 "reset_firmware": false,
             })
         );
+        assert_firmware_safe_filename(&response.filename);
     }
 
     #[tokio::test]
@@ -985,6 +1030,80 @@ mod tests {
             .expect("display should return image URL");
 
         assert_returned_image_url_fetches_png(state, &response.image_url, firmware_headers).await;
+    }
+
+    #[tokio::test]
+    async fn trmnl_setup_and_display_share_content_filename() {
+        let database = TestDatabase::new("trmnl_setup_display_filename");
+        let state = initialized_state(&database);
+        state.store.add_entry("milk").expect("entry should insert");
+
+        let Json(setup_response) =
+            trmnl_setup(State(state.clone()), trmnl_headers_with_id("device-123"))
+                .await
+                .expect("setup should return filename");
+        let Json(display_response) = trmnl_display(State(state), valid_trmnl_headers())
+            .await
+            .expect("display should return filename");
+
+        assert_eq!(setup_response.filename, display_response.filename);
+        assert_firmware_safe_filename(&setup_response.filename);
+    }
+
+    #[tokio::test]
+    async fn repeated_trmnl_display_requests_without_list_changes_keep_filename() {
+        let database = TestDatabase::new("trmnl_display_stable_filename");
+        let state = initialized_state(&database);
+        state.store.add_entry("milk").expect("entry should insert");
+
+        let Json(first_response) = trmnl_display(State(state.clone()), valid_trmnl_headers())
+            .await
+            .expect("first display should return filename");
+        let Json(second_response) = trmnl_display(State(state), valid_trmnl_headers())
+            .await
+            .expect("second display should return filename");
+
+        assert_eq!(first_response.filename, second_response.filename);
+        assert_firmware_safe_filename(&first_response.filename);
+    }
+
+    #[tokio::test]
+    async fn adding_entry_changes_trmnl_display_filename() {
+        let database = TestDatabase::new("trmnl_display_add_changes_filename");
+        let state = initialized_state(&database);
+
+        let Json(empty_response) = trmnl_display(State(state.clone()), valid_trmnl_headers())
+            .await
+            .expect("empty display should return filename");
+        state.store.add_entry("milk").expect("entry should insert");
+        let Json(updated_response) = trmnl_display(State(state), valid_trmnl_headers())
+            .await
+            .expect("updated display should return filename");
+
+        assert_ne!(empty_response.filename, updated_response.filename);
+        assert_firmware_safe_filename(&updated_response.filename);
+    }
+
+    #[tokio::test]
+    async fn removing_entry_changes_trmnl_display_filename() {
+        let database = TestDatabase::new("trmnl_display_remove_changes_filename");
+        let state = initialized_state(&database);
+        state.store.add_entry("milk").expect("entry should insert");
+        state.store.add_entry("eggs").expect("entry should insert");
+
+        let Json(original_response) = trmnl_display(State(state.clone()), valid_trmnl_headers())
+            .await
+            .expect("original display should return filename");
+        state
+            .store
+            .remove_entry_by_text("milk")
+            .expect("entry should remove");
+        let Json(updated_response) = trmnl_display(State(state), valid_trmnl_headers())
+            .await
+            .expect("updated display should return filename");
+
+        assert_ne!(original_response.filename, updated_response.filename);
+        assert_firmware_safe_filename(&updated_response.filename);
     }
 
     #[tokio::test]
@@ -1374,6 +1493,13 @@ mod tests {
 
         assert_eq!(image.width(), 800);
         assert_eq!(image.height(), 480);
+    }
+
+    fn assert_firmware_safe_filename(filename: &str) {
+        assert!(filename.ends_with(".png"));
+        assert!(filename.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '.')
+        }));
     }
 
     async fn fetch_returned_image_url(
