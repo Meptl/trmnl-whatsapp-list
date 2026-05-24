@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -34,9 +34,95 @@ struct WhatsAppVerifyQuery {
     challenge: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct TrmnlTokenQuery {
-    token: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrmnlFirmwareHeaders {
+    device_id: String,
+    access_token: Option<String>,
+    battery_voltage: Option<String>,
+    fw_version: Option<String>,
+    rssi: Option<String>,
+    refresh_rate: Option<String>,
+    model: Option<String>,
+    width: Option<String>,
+    height: Option<String>,
+    update_source: Option<String>,
+    temperature_profile: Option<String>,
+    sensors: Option<String>,
+}
+
+impl TrmnlFirmwareHeaders {
+    fn from_headers(headers: &HeaderMap) -> Result<Self, StatusCode> {
+        Ok(Self {
+            device_id: required_header(headers, "id", StatusCode::BAD_REQUEST)?,
+            access_token: optional_header(headers, "access-token"),
+            battery_voltage: optional_header(headers, "battery-voltage"),
+            fw_version: optional_header(headers, "fw-version"),
+            rssi: optional_header(headers, "rssi"),
+            refresh_rate: optional_header(headers, "refresh-rate"),
+            model: optional_header(headers, "model"),
+            width: optional_header(headers, "width"),
+            height: optional_header(headers, "height"),
+            update_source: optional_header(headers, "update-source"),
+            temperature_profile: optional_header(headers, "temperature-profile"),
+            sensors: optional_header(headers, "sensors"),
+        })
+    }
+
+    fn require_access_token(&self) -> Result<&str, StatusCode> {
+        self.access_token.as_deref().ok_or(StatusCode::FORBIDDEN)
+    }
+
+    fn validate_access_token(&self, expected_token: &str) -> Result<(), StatusCode> {
+        match self.require_access_token() {
+            Ok(access_token) if access_token == expected_token => Ok(()),
+            _ => Err(StatusCode::FORBIDDEN),
+        }
+    }
+
+    fn telemetry_summary(&self) -> Option<String> {
+        let mut telemetry = Vec::new();
+        push_optional_telemetry(&mut telemetry, "battery-voltage", &self.battery_voltage);
+        push_optional_telemetry(&mut telemetry, "fw-version", &self.fw_version);
+        push_optional_telemetry(&mut telemetry, "rssi", &self.rssi);
+        push_optional_telemetry(&mut telemetry, "refresh-rate", &self.refresh_rate);
+        push_optional_telemetry(&mut telemetry, "model", &self.model);
+        push_optional_telemetry(&mut telemetry, "width", &self.width);
+        push_optional_telemetry(&mut telemetry, "height", &self.height);
+        push_optional_telemetry(&mut telemetry, "update-source", &self.update_source);
+        push_optional_telemetry(
+            &mut telemetry,
+            "temperature-profile",
+            &self.temperature_profile,
+        );
+        push_optional_telemetry(&mut telemetry, "sensors", &self.sensors);
+
+        if telemetry.is_empty() {
+            None
+        } else {
+            Some(telemetry.join(", "))
+        }
+    }
+}
+
+fn push_optional_telemetry(telemetry: &mut Vec<String>, name: &str, value: &Option<String>) {
+    if let Some(value) = value {
+        telemetry.push(format!("{name}={value}"));
+    }
+}
+
+fn required_header(
+    headers: &HeaderMap,
+    name: &'static str,
+    missing_or_invalid: StatusCode,
+) -> Result<String, StatusCode> {
+    optional_header(headers, name).ok_or(missing_or_invalid)
+}
+
+fn optional_header(headers: &HeaderMap, name: &'static str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 async fn whatsapp_verify(
@@ -94,25 +180,23 @@ fn whatsapp_webhook_status(result: Result<(), WhatsAppWebhookError>) -> StatusCo
 
 async fn trmnl_display(
     State(state): State<AppState>,
-    Query(query): Query<TrmnlTokenQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<trmnl::DisplayResponse>, StatusCode> {
     acknowledge_state_shape(&state);
-    let token = validate_trmnl_token(&state, query)?;
-    let encoded_token = percent_encode_query_component(&token);
-    let image_url = format!(
-        "{}/trmnl/list.png?token={encoded_token}",
-        state.config.public_base_url
-    );
+    let firmware_headers = TrmnlFirmwareHeaders::from_headers(&headers)?;
+    firmware_headers.validate_access_token(state.config.trmnl.token.as_str())?;
+    let image_url = format!("{}/trmnl/list.png", state.config.public_base_url);
 
     Ok(Json(trmnl::DisplayResponse::new(image_url, "list.png")))
 }
 
 async fn trmnl_image(
     State(state): State<AppState>,
-    Query(query): Query<TrmnlTokenQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     acknowledge_state_shape(&state);
-    validate_trmnl_token(&state, query)?;
+    let firmware_headers = TrmnlFirmwareHeaders::from_headers(&headers)?;
+    firmware_headers.validate_access_token(state.config.trmnl.token.as_str())?;
 
     let entries = state
         .store
@@ -127,8 +211,21 @@ async fn trmnl_image(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-async fn trmnl_log(State(state): State<AppState>, body: String) -> StatusCode {
+async fn trmnl_log(State(state): State<AppState>, headers: HeaderMap, body: String) -> StatusCode {
     acknowledge_state_shape(&state);
+    let firmware_headers = match TrmnlFirmwareHeaders::from_headers(&headers) {
+        Ok(firmware_headers) => firmware_headers,
+        Err(status) => return status,
+    };
+    if let Err(status) = firmware_headers.validate_access_token(state.config.trmnl.token.as_str()) {
+        return status;
+    }
+    if let Some(summary) = firmware_headers.telemetry_summary() {
+        println!(
+            "TRMNL log headers from {}: {summary}",
+            firmware_headers.device_id
+        );
+    }
 
     if body.trim().is_empty() {
         return StatusCode::OK;
@@ -142,30 +239,6 @@ async fn trmnl_log(State(state): State<AppState>, body: String) -> StatusCode {
 
 fn acknowledge_state_shape(state: &AppState) {
     let _ = (&state.config, &state.store, &state.whatsapp_client);
-}
-
-fn validate_trmnl_token(state: &AppState, query: TrmnlTokenQuery) -> Result<String, StatusCode> {
-    match query.token {
-        Some(token) if token == state.config.trmnl.token.as_str() => Ok(token),
-        _ => Err(StatusCode::FORBIDDEN),
-    }
-}
-
-fn percent_encode_query_component(value: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push('%');
-            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-            encoded.push(char::from(HEX[usize::from(byte & 0x0F)]));
-        }
-    }
-
-    encoded
 }
 
 const TRMNL_IMAGE_WIDTH: u32 = 800;
@@ -515,6 +588,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use axum::http::HeaderValue;
+
     use super::*;
     use crate::config::{AppConfig, SecretString, TrmnlConfig, WhatsAppConfig};
 
@@ -525,6 +600,134 @@ mod tests {
         let app = router(state);
 
         assert!(app.has_routes());
+    }
+
+    #[test]
+    fn trmnl_firmware_headers_extract_required_device_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("id", HeaderValue::from_static("device-123"));
+
+        let firmware_headers =
+            TrmnlFirmwareHeaders::from_headers(&headers).expect("id header should extract");
+
+        assert_eq!(firmware_headers.device_id, "device-123");
+    }
+
+    #[test]
+    fn trmnl_firmware_headers_reject_missing_or_invalid_device_id() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            TrmnlFirmwareHeaders::from_headers(&headers),
+            Err(StatusCode::BAD_REQUEST)
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "id",
+            HeaderValue::from_bytes(b"\xFF").expect("opaque header value should construct"),
+        );
+
+        assert_eq!(
+            TrmnlFirmwareHeaders::from_headers(&headers),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn trmnl_firmware_headers_extract_and_validate_access_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert("id", HeaderValue::from_static("device-123"));
+        headers.insert("access-token", HeaderValue::from_static("access-secret"));
+
+        let firmware_headers =
+            TrmnlFirmwareHeaders::from_headers(&headers).expect("headers should extract");
+
+        assert_eq!(firmware_headers.require_access_token(), Ok("access-secret"));
+        assert_eq!(
+            firmware_headers.validate_access_token("access-secret"),
+            Ok(())
+        );
+        assert_eq!(
+            firmware_headers.validate_access_token("wrong-secret"),
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn trmnl_firmware_headers_reject_missing_or_invalid_access_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert("id", HeaderValue::from_static("device-123"));
+        assert_eq!(
+            TrmnlFirmwareHeaders::from_headers(&headers)
+                .expect("id header should extract")
+                .require_access_token(),
+            Err(StatusCode::FORBIDDEN)
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("id", HeaderValue::from_static("device-123"));
+        headers.insert(
+            "access-token",
+            HeaderValue::from_bytes(b"\xFF").expect("opaque header value should construct"),
+        );
+
+        assert_eq!(
+            TrmnlFirmwareHeaders::from_headers(&headers)
+                .expect("id header should extract")
+                .require_access_token(),
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn trmnl_firmware_headers_store_optional_telemetry_as_strings() {
+        let mut headers = HeaderMap::new();
+        headers.insert("id", HeaderValue::from_static("device-123"));
+        headers.insert("battery-voltage", HeaderValue::from_static("not-a-number"));
+        headers.insert("fw-version", HeaderValue::from_static("1.8.2"));
+        headers.insert("rssi", HeaderValue::from_static("-61"));
+        headers.insert("refresh-rate", HeaderValue::from_static("900"));
+        headers.insert("model", HeaderValue::from_static("og_png"));
+        headers.insert("width", HeaderValue::from_static("800"));
+        headers.insert("height", HeaderValue::from_static("480"));
+        headers.insert("update-source", HeaderValue::from_static("firmware"));
+        headers.insert("temperature-profile", HeaderValue::from_static("cold"));
+        headers.insert("sensors", HeaderValue::from_static("battery,wifi"));
+
+        let firmware_headers =
+            TrmnlFirmwareHeaders::from_headers(&headers).expect("headers should extract");
+
+        assert_eq!(
+            firmware_headers.battery_voltage.as_deref(),
+            Some("not-a-number")
+        );
+        assert_eq!(firmware_headers.fw_version.as_deref(), Some("1.8.2"));
+        assert_eq!(firmware_headers.rssi.as_deref(), Some("-61"));
+        assert_eq!(firmware_headers.refresh_rate.as_deref(), Some("900"));
+        assert_eq!(firmware_headers.model.as_deref(), Some("og_png"));
+        assert_eq!(firmware_headers.width.as_deref(), Some("800"));
+        assert_eq!(firmware_headers.height.as_deref(), Some("480"));
+        assert_eq!(firmware_headers.update_source.as_deref(), Some("firmware"));
+        assert_eq!(
+            firmware_headers.temperature_profile.as_deref(),
+            Some("cold")
+        );
+        assert_eq!(firmware_headers.sensors.as_deref(), Some("battery,wifi"));
+    }
+
+    #[test]
+    fn trmnl_firmware_headers_ignore_invalid_optional_telemetry_without_panic() {
+        let mut headers = HeaderMap::new();
+        headers.insert("id", HeaderValue::from_static("device-123"));
+        headers.insert(
+            "battery-voltage",
+            HeaderValue::from_bytes(b"\xFF").expect("opaque header value should construct"),
+        );
+
+        let firmware_headers =
+            TrmnlFirmwareHeaders::from_headers(&headers).expect("headers should extract");
+
+        assert_eq!(firmware_headers.battery_voltage, None);
     }
 
     #[tokio::test]
@@ -573,52 +776,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trmnl_display_returns_image_response_for_valid_token() {
+    async fn trmnl_display_returns_image_response_for_valid_firmware_headers() {
         let state = AppState::new_uninitialized(test_config());
 
-        let Json(response) = trmnl_display(
-            State(state),
-            Query(TrmnlTokenQuery {
-                token: Some("trmnl-secret".to_owned()),
-            }),
-        )
-        .await
-        .expect("valid token should return display response");
+        let Json(response) = trmnl_display(State(state), valid_trmnl_headers())
+            .await
+            .expect("valid firmware headers should return display response");
         let json = serde_json::to_value(response).expect("display response should serialize");
 
         assert_eq!(json["status"], 0);
-        assert_eq!(
-            json["image_url"],
-            "https://example.test/trmnl/list.png?token=trmnl-secret"
-        );
+        assert_eq!(json["image_url"], "https://example.test/trmnl/list.png");
         assert_eq!(json["filename"], "list.png");
     }
 
     #[tokio::test]
-    async fn trmnl_display_percent_encodes_reserved_token_in_image_url() {
-        let token = "trmnl&secret+value#part=1";
-        let mut config = test_config();
-        config.trmnl.token = SecretString::from_test_value(token);
-        let state = AppState::new_uninitialized(config);
-
-        let Json(response) = trmnl_display(
-            State(state),
-            Query(TrmnlTokenQuery {
-                token: Some(token.to_owned()),
-            }),
-        )
-        .await
-        .expect("valid token should return display response");
-        let json = serde_json::to_value(response).expect("display response should serialize");
+    async fn trmnl_display_rejects_missing_id() {
+        let state = AppState::new_uninitialized(test_config());
 
         assert_eq!(
-            json["image_url"],
-            "https://example.test/trmnl/list.png?token=trmnl%26secret%2Bvalue%23part%3D1"
+            trmnl_display(State(state), trmnl_headers_without_id())
+                .await
+                .err(),
+            Some(StatusCode::BAD_REQUEST)
         );
     }
 
     #[tokio::test]
-    async fn trmnl_image_returns_png_for_valid_token() {
+    async fn trmnl_display_rejects_missing_access_token() {
+        let state = AppState::new_uninitialized(test_config());
+
+        assert_eq!(
+            trmnl_display(State(state), trmnl_headers_without_access_token())
+                .await
+                .err(),
+            Some(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[tokio::test]
+    async fn trmnl_display_rejects_wrong_access_token() {
+        let state = AppState::new_uninitialized(test_config());
+
+        assert_eq!(
+            trmnl_display(
+                State(state),
+                trmnl_headers_with_access_token("wrong-secret")
+            )
+            .await
+            .err(),
+            Some(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[tokio::test]
+    async fn trmnl_display_rejects_query_token_only_request_shape() {
+        let state = AppState::new_uninitialized(test_config());
+
+        assert_eq!(
+            trmnl_display(State(state), HeaderMap::new()).await.err(),
+            Some(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[tokio::test]
+    async fn trmnl_image_returns_png_for_valid_firmware_headers() {
         let database = TestDatabase::new("trmnl_image_png");
         let state = initialized_state(&database);
         state
@@ -630,14 +851,9 @@ mod tests {
             .add_entry("eggs")
             .expect("second entry should insert");
 
-        let response = trmnl_image(
-            State(state),
-            Query(TrmnlTokenQuery {
-                token: Some("trmnl-secret".to_owned()),
-            }),
-        )
-        .await
-        .expect("valid token should return image response");
+        let response = trmnl_image(State(state), valid_trmnl_headers())
+            .await
+            .expect("valid firmware headers should return image response");
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -658,14 +874,9 @@ mod tests {
         let database = TestDatabase::new("trmnl_image_empty");
         let state = initialized_state(&database);
 
-        let response = trmnl_image(
-            State(state),
-            Query(TrmnlTokenQuery {
-                token: Some("trmnl-secret".to_owned()),
-            }),
-        )
-        .await
-        .expect("valid token should return image response");
+        let response = trmnl_image(State(state), valid_trmnl_headers())
+            .await
+            .expect("valid firmware headers should return image response");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("image body should read");
@@ -684,14 +895,9 @@ mod tests {
             .add_entry("a".repeat(500))
             .expect("long entry should insert");
 
-        let response = trmnl_image(
-            State(state),
-            Query(TrmnlTokenQuery {
-                token: Some("trmnl-secret".to_owned()),
-            }),
-        )
-        .await
-        .expect("valid token should return image response");
+        let response = trmnl_image(State(state), valid_trmnl_headers())
+            .await
+            .expect("valid firmware headers should return image response");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("image body should read");
@@ -707,6 +913,7 @@ mod tests {
 
         let status = trmnl_log(
             State(state),
+            valid_trmnl_headers(),
             r#"{
                 "device": "trmnl",
                 "battery_voltage": 4.12,
@@ -729,6 +936,7 @@ mod tests {
 
         let status = trmnl_log(
             State(state.clone()),
+            valid_trmnl_headers(),
             r#"{"device":"trmnl","event":"refresh"}"#.to_owned(),
         )
         .await;
@@ -744,49 +952,103 @@ mod tests {
         let state = AppState::new_uninitialized(test_config());
 
         assert_eq!(
-            trmnl_log(State(state), "{".to_owned()).await,
+            trmnl_log(State(state), valid_trmnl_headers(), "{".to_owned()).await,
             StatusCode::BAD_REQUEST
         );
     }
 
     #[tokio::test]
-    async fn trmnl_display_rejects_wrong_or_missing_token() {
+    async fn trmnl_log_accepts_empty_body_with_valid_firmware_headers() {
         let state = AppState::new_uninitialized(test_config());
 
-        assert!(matches!(
-            trmnl_display(
-                State(state.clone()),
-                Query(TrmnlTokenQuery {
-                    token: Some("wrong-secret".to_owned()),
-                }),
-            )
-            .await,
-            Err(StatusCode::FORBIDDEN)
-        ));
-        assert!(matches!(
-            trmnl_display(State(state), Query(TrmnlTokenQuery { token: None })).await,
-            Err(StatusCode::FORBIDDEN)
-        ));
+        assert_eq!(
+            trmnl_log(State(state), valid_trmnl_headers(), String::new()).await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
-    async fn trmnl_image_rejects_wrong_or_missing_token() {
+    async fn trmnl_log_rejects_missing_id() {
         let state = AppState::new_uninitialized(test_config());
 
-        assert!(matches!(
-            trmnl_image(
-                State(state.clone()),
-                Query(TrmnlTokenQuery {
-                    token: Some("wrong-secret".to_owned()),
-                }),
+        assert_eq!(
+            trmnl_log(
+                State(state),
+                trmnl_headers_without_id(),
+                r#"{"event":"refresh"}"#.to_owned(),
             )
             .await,
-            Err(StatusCode::FORBIDDEN)
-        ));
-        assert!(matches!(
-            trmnl_image(State(state), Query(TrmnlTokenQuery { token: None })).await,
-            Err(StatusCode::FORBIDDEN)
-        ));
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn trmnl_log_rejects_missing_access_token() {
+        let state = AppState::new_uninitialized(test_config());
+
+        assert_eq!(
+            trmnl_log(
+                State(state),
+                trmnl_headers_without_access_token(),
+                r#"{"event":"refresh"}"#.to_owned(),
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn trmnl_log_rejects_wrong_access_token() {
+        let state = AppState::new_uninitialized(test_config());
+
+        assert_eq!(
+            trmnl_log(
+                State(state),
+                trmnl_headers_with_access_token("wrong-secret"),
+                r#"{"event":"refresh"}"#.to_owned(),
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn trmnl_image_rejects_missing_id() {
+        let state = AppState::new_uninitialized(test_config());
+
+        assert_eq!(
+            trmnl_image(State(state), trmnl_headers_without_id())
+                .await
+                .err(),
+            Some(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[tokio::test]
+    async fn trmnl_image_rejects_missing_access_token() {
+        let state = AppState::new_uninitialized(test_config());
+
+        assert_eq!(
+            trmnl_image(State(state), trmnl_headers_without_access_token())
+                .await
+                .err(),
+            Some(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[tokio::test]
+    async fn trmnl_image_rejects_wrong_access_token() {
+        let state = AppState::new_uninitialized(test_config());
+
+        assert_eq!(
+            trmnl_image(
+                State(state),
+                trmnl_headers_with_access_token("wrong-secret")
+            )
+            .await
+            .err(),
+            Some(StatusCode::FORBIDDEN)
+        );
     }
 
     #[tokio::test]
@@ -889,6 +1151,32 @@ mod tests {
             whatsapp_webhook(State(state), "{".to_owned()).await,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    fn valid_trmnl_headers() -> HeaderMap {
+        trmnl_headers_with_access_token("trmnl-secret")
+    }
+
+    fn trmnl_headers_with_access_token(access_token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("id", HeaderValue::from_static("device-123"));
+        headers.insert(
+            "access-token",
+            HeaderValue::from_str(access_token).expect("test access token should be valid"),
+        );
+        headers
+    }
+
+    fn trmnl_headers_without_id() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("access-token", HeaderValue::from_static("trmnl-secret"));
+        headers
+    }
+
+    fn trmnl_headers_without_access_token() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("id", HeaderValue::from_static("device-123"));
+        headers
     }
 
     fn test_config() -> AppConfig {
