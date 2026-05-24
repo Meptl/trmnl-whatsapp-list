@@ -50,16 +50,37 @@ rules into Axum-specific code.
 
 ## TRMNL BYOS
 
-TRMNL integration uses BYOS endpoints:
+TRMNL integration targets physical BYOS firmware 1.8.2 with these endpoints:
 
+- setup handshake at `/api/setup`
 - display metadata at `/api/display`
 - rendered PNG at `/trmnl/list.png`
 - telemetry at `/api/log`
 
+The operator chooses `TRMNL_TOKEN` as a server-side environment variable. The
+operator does not type that token into the device. During setup, firmware sends
+`GET /api/setup` with its `ID` header, and the service returns the token as
+`api_key`. Later firmware requests send the same value as the `Access-Token`
+header.
+
+The BYOS request flow is:
+
+1. `GET /api/setup` with `ID`.
+2. `GET /api/display` with `ID` and `Access-Token`.
+3. Fetch the returned `image_url`, currently `/trmnl/list.png`, with `ID` and
+   `Access-Token`.
+4. `POST /api/log` with `ID` and `Access-Token`.
+
+`PUBLIC_BASE_URL` must be the externally reachable HTTPS base URL the device
+uses to fetch returned image URLs. Cloud deployments should bind on an address
+appropriate for the host, often `0.0.0.0:$PORT` when the platform injects
+`PORT`.
+
 Display content should stay e-ink friendly: list title, entry count, current
 entries in creation order, an empty state, and a generated timestamp.
 
-TRMNL display and image endpoints require the shared `TRMNL_TOKEN`.
+TRMNL display, image, and log endpoints require the firmware `Access-Token`
+header to match the server-side `TRMNL_TOKEN`.
 
 ## Compatibility
 

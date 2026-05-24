@@ -26,6 +26,7 @@ The implemented foundation currently includes:
 - WhatsApp Cloud API webhook payload parsing for inbound text messages.
 - Meta Graph API text reply request construction and sending through the
   WhatsApp webhook POST flow.
+- TRMNL BYOS setup response generation.
 - TRMNL BYOS display response generation.
 - TRMNL 800x480 PNG rendering for the current list.
 - TRMNL telemetry acceptance for empty bodies or valid JSON.
@@ -46,6 +47,15 @@ Optional environment variables:
 
 - `DATABASE_PATH`, defaulting to `list.db`
 - `BIND_ADDR`, defaulting to `127.0.0.1:3000`
+
+`TRMNL_TOKEN` is a server-side secret. Operators do not type it into the
+physical TRMNL device. `GET /api/setup` returns it as `api_key`, and firmware
+sends it back on later requests as the `Access-Token` header.
+
+`PUBLIC_BASE_URL` must be the externally reachable HTTPS base URL for the cloud
+deployment because display responses use it to build the device-fetchable image
+URL. `BIND_ADDR` should match the hosting platform; cloud hosts often require
+`0.0.0.0:$PORT` when they inject `PORT`.
 
 Missing required variables return `ConfigError::MissingRequiredVariable` with
 the variable name. Invalid Unicode in environment keys or values returns
@@ -99,11 +109,14 @@ The Axum routes are:
 
 - `GET /webhooks/whatsapp`
 - `POST /webhooks/whatsapp`
+- `GET /api/setup`
 - `GET /api/display`
 - `GET /trmnl/list.png`
 - `POST /api/log`
 
-TRMNL endpoints that expose display content require the shared `TRMNL_TOKEN`.
+TRMNL display, image, and log endpoints require firmware headers. `ID` is
+required for all TRMNL BYOS endpoints. `Access-Token` is required for display,
+image, and log requests and must match the server-side `TRMNL_TOKEN`.
 WhatsApp verification compares Meta's `hub.verify_token` against
 `WHATSAPP_VERIFY_TOKEN` and returns the provided challenge only on a match.
 
@@ -112,11 +125,25 @@ Handler behavior:
 - `GET /webhooks/whatsapp` verifies Meta's challenge.
 - `POST /webhooks/whatsapp` parses inbound text messages, toggles matching list
   entries, logs reply text, and sends replies.
-- `GET /api/display` returns a TRMNL display response containing the list PNG
-  URL.
+- `GET /api/setup` returns TRMNL setup JSON with `api_key`, `friendly_id`,
+  `image_url`, and `filename`.
+- `GET /api/display` returns TRMNL display JSON containing the list PNG URL.
 - `GET /trmnl/list.png` renders the current list as an 800x480 PNG.
 - `POST /api/log` accepts empty telemetry bodies or valid JSON and rejects
   invalid JSON.
+
+The physical BYOS firmware flow is:
+
+1. `GET /api/setup` with `ID`.
+2. `GET /api/display` with `ID` and `Access-Token`.
+3. Fetch the returned `image_url`, currently `/trmnl/list.png`, with `ID` and
+   `Access-Token`.
+4. `POST /api/log` with `ID` and `Access-Token`.
+
+A publicly reachable deployment is not enough on its own. Firmware 1.8.2 needs
+the setup endpoint, and subsequent display requests use header authentication.
+An implementation that only accepts `/api/display?token=...` does not satisfy
+the physical-device flow.
 
 ## WhatsApp Components
 
