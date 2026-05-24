@@ -85,12 +85,17 @@ impl WhatsAppReplyClient {
     ) -> Result<(), WhatsAppReplyError> {
         let request = self.build_text_reply_request(inbound_sender, reply_text)?;
 
-        self.http_client
+        let response = self
+            .http_client
             .execute(request)
             .await
-            .map_err(WhatsAppReplyError::Send)?
-            .error_for_status()
-            .map_err(WhatsAppReplyError::HttpStatus)?;
+            .map_err(WhatsAppReplyError::Send)?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let body = response.text().await.map_err(WhatsAppReplyError::Send)?;
+            return Err(WhatsAppReplyError::HttpStatus { status, body });
+        }
 
         Ok(())
     }
@@ -116,7 +121,10 @@ impl fmt::Debug for WhatsAppReplyClient {
 pub enum WhatsAppReplyError {
     RequestBuild(reqwest::Error),
     Send(reqwest::Error),
-    HttpStatus(reqwest::Error),
+    HttpStatus {
+        status: reqwest::StatusCode,
+        body: String,
+    },
 }
 
 impl fmt::Display for WhatsAppReplyError {
@@ -128,9 +136,9 @@ impl fmt::Display for WhatsAppReplyError {
             Self::Send(error) => {
                 write!(formatter, "failed to send WhatsApp reply request: {error}")
             }
-            Self::HttpStatus(error) => write!(
+            Self::HttpStatus { status, body } => write!(
                 formatter,
-                "WhatsApp reply request returned an unsuccessful status: {error}"
+                "WhatsApp reply request returned an unsuccessful status: HTTP {status}: {body}"
             ),
         }
     }
@@ -139,7 +147,8 @@ impl fmt::Display for WhatsAppReplyError {
 impl Error for WhatsAppReplyError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::RequestBuild(error) | Self::Send(error) | Self::HttpStatus(error) => Some(error),
+            Self::RequestBuild(error) | Self::Send(error) => Some(error),
+            Self::HttpStatus { .. } => None,
         }
     }
 }
@@ -239,6 +248,7 @@ struct WhatsAppText {
 #[derive(Serialize)]
 struct TextReplyPayload<'a> {
     messaging_product: &'static str,
+    recipient_type: &'static str,
     to: &'a str,
     #[serde(rename = "type")]
     message_type: &'static str,
@@ -249,6 +259,7 @@ impl<'a> TextReplyPayload<'a> {
     fn new(to: &'a str, body: &'a str) -> Self {
         Self {
             messaging_product: "whatsapp",
+            recipient_type: "individual",
             to,
             message_type: "text",
             text: TextReplyBody { body },
@@ -497,6 +508,7 @@ mod tests {
             serde_json::from_slice(body).expect("request body should be JSON");
 
         assert_eq!(payload["messaging_product"], "whatsapp");
+        assert_eq!(payload["recipient_type"], "individual");
         assert_eq!(payload["to"], "15550000001");
         assert_eq!(payload["type"], "text");
         assert_eq!(payload["text"]["body"], "Added milk");
