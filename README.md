@@ -181,6 +181,15 @@ curl -i -X POST https://HOST/api/log \
 For the image fetch, use the exact `image_url` returned by `/api/display`. It is
 currently `https://HOST/trmnl/list.png` when `PUBLIC_BASE_URL=https://HOST`.
 
+The same BYOS flow can be checked with the smoke script:
+
+```sh
+TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token" \
+  scripts/smoke-trmnl-byos.sh https://HOST
+```
+
+Set `DEVICE_ID` to override the default `test-device` ID header.
+
 ## Check
 
 Required verification commands:
