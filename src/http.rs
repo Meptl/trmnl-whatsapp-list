@@ -902,6 +902,20 @@ mod tests {
         assert!(!serialized.contains("access-secret"));
     }
 
+    #[tokio::test]
+    async fn trmnl_setup_image_url_fetches_png_with_same_firmware_headers() {
+        let database = TestDatabase::new("trmnl_setup_image_url_fetch");
+        let state = initialized_state(&database);
+        state.store.add_entry("milk").expect("entry should insert");
+        let firmware_headers = valid_trmnl_headers();
+
+        let Json(response) = trmnl_setup(State(state.clone()), firmware_headers.clone())
+            .await
+            .expect("setup should return image URL");
+
+        assert_returned_image_url_fetches_png(state, &response.image_url, firmware_headers).await;
+    }
+
     #[test]
     fn trmnl_friendly_id_is_deterministic_safe_suffix() {
         let device_id = "AA:BB:CC:DD:EE:FF";
@@ -957,6 +971,20 @@ mod tests {
                 "reset_firmware": false,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn trmnl_display_image_url_fetches_png_with_same_firmware_headers() {
+        let database = TestDatabase::new("trmnl_display_image_url_fetch");
+        let state = initialized_state(&database);
+        state.store.add_entry("eggs").expect("entry should insert");
+        let firmware_headers = valid_trmnl_headers();
+
+        let Json(response) = trmnl_display(State(state.clone()), firmware_headers.clone())
+            .await
+            .expect("display should return image URL");
+
+        assert_returned_image_url_fetches_png(state, &response.image_url, firmware_headers).await;
     }
 
     #[tokio::test]
@@ -1325,6 +1353,46 @@ mod tests {
 
     fn valid_trmnl_headers() -> HeaderMap {
         trmnl_headers_with_access_token("trmnl-secret")
+    }
+
+    async fn assert_returned_image_url_fetches_png(
+        state: AppState,
+        image_url: &str,
+        firmware_headers: HeaderMap,
+    ) {
+        let response = fetch_returned_image_url(state, image_url, firmware_headers).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("image/png"))
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("image body should read");
+        let image = image::load_from_memory(&bytes).expect("body should decode as image");
+
+        assert_eq!(image.width(), 800);
+        assert_eq!(image.height(), 480);
+    }
+
+    async fn fetch_returned_image_url(
+        state: AppState,
+        image_url: &str,
+        firmware_headers: HeaderMap,
+    ) -> Response {
+        let url = reqwest::Url::parse(image_url).expect("image URL should parse");
+
+        assert_eq!(url.as_str(), image_url);
+        assert_eq!(url.as_str(), "https://example.test/trmnl/list.png");
+        assert_eq!(url.query(), None);
+
+        match url.path() {
+            "/trmnl/list.png" => trmnl_image(State(state), firmware_headers)
+                .await
+                .expect("returned image URL path should fetch with firmware headers"),
+            path => panic!("unexpected returned image URL path: {path}"),
+        }
     }
 
     fn trmnl_headers_with_id(device_id: &str) -> HeaderMap {
