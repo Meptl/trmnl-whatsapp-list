@@ -235,9 +235,16 @@ async fn trmnl_setup(
     headers: HeaderMap,
 ) -> Result<Json<TrmnlSetupResponse>, StatusCode> {
     acknowledge_state_shape(&state);
-    let firmware_headers = TrmnlFirmwareHeaders::from_headers(&headers)?;
+    let firmware_headers = match TrmnlFirmwareHeaders::from_headers(&headers) {
+        Ok(firmware_headers) => firmware_headers,
+        Err(status) => {
+            log_trmnl_rejection("/api/setup", status);
+            return Err(status);
+        }
+    };
     let image_url = format!("{}/trmnl/list.png", state.config.public_base_url);
     let filename = trmnl_display_filename(&state.store)?;
+    log_trmnl_success("/api/setup", &firmware_headers, StatusCode::OK);
 
     Ok(Json(TrmnlSetupResponse::new(
         state.config.trmnl.token.as_str(),
@@ -284,10 +291,20 @@ async fn trmnl_display(
     headers: HeaderMap,
 ) -> Result<Json<TrmnlDisplayResponse>, StatusCode> {
     acknowledge_state_shape(&state);
-    let firmware_headers = TrmnlFirmwareHeaders::from_headers(&headers)?;
-    firmware_headers.validate_access_token(state.config.trmnl.token.as_str())?;
+    let firmware_headers = match TrmnlFirmwareHeaders::from_headers(&headers) {
+        Ok(firmware_headers) => firmware_headers,
+        Err(status) => {
+            log_trmnl_rejection("/api/display", status);
+            return Err(status);
+        }
+    };
+    if let Err(status) = firmware_headers.validate_access_token(state.config.trmnl.token.as_str()) {
+        log_trmnl_success("/api/display", &firmware_headers, status);
+        return Err(status);
+    }
     let image_url = format!("{}/trmnl/list.png", state.config.public_base_url);
     let filename = trmnl_display_filename(&state.store)?;
+    log_trmnl_success("/api/display", &firmware_headers, StatusCode::OK);
 
     Ok(Json(TrmnlDisplayResponse::new(image_url, filename)))
 }
@@ -336,14 +353,24 @@ async fn trmnl_image(
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     acknowledge_state_shape(&state);
-    let firmware_headers = TrmnlFirmwareHeaders::from_headers(&headers)?;
-    firmware_headers.validate_access_token(state.config.trmnl.token.as_str())?;
+    let firmware_headers = match TrmnlFirmwareHeaders::from_headers(&headers) {
+        Ok(firmware_headers) => firmware_headers,
+        Err(status) => {
+            log_trmnl_rejection("/trmnl/list.png", status);
+            return Err(status);
+        }
+    };
+    if let Err(status) = firmware_headers.validate_access_token(state.config.trmnl.token.as_str()) {
+        log_trmnl_success("/trmnl/list.png", &firmware_headers, status);
+        return Err(status);
+    }
 
     let entries = state
         .store
         .list_entries()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let png = render_trmnl_list_png(&entries).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    log_trmnl_success("/trmnl/list.png", &firmware_headers, StatusCode::OK);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -356,25 +383,49 @@ async fn trmnl_log(State(state): State<AppState>, headers: HeaderMap, body: Stri
     acknowledge_state_shape(&state);
     let firmware_headers = match TrmnlFirmwareHeaders::from_headers(&headers) {
         Ok(firmware_headers) => firmware_headers,
-        Err(status) => return status,
+        Err(status) => {
+            log_trmnl_rejection("/api/log", status);
+            return status;
+        }
     };
     if let Err(status) = firmware_headers.validate_access_token(state.config.trmnl.token.as_str()) {
+        log_trmnl_success("/api/log", &firmware_headers, status);
         return status;
-    }
-    if let Some(summary) = firmware_headers.telemetry_summary() {
-        println!(
-            "TRMNL log headers from {}: {summary}",
-            firmware_headers.device_id
-        );
     }
 
     if body.trim().is_empty() {
+        log_trmnl_success("/api/log", &firmware_headers, StatusCode::OK);
         return StatusCode::OK;
     }
 
     match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(_) => StatusCode::OK,
-        Err(_) => StatusCode::BAD_REQUEST,
+        Ok(_) => {
+            log_trmnl_success("/api/log", &firmware_headers, StatusCode::OK);
+            StatusCode::OK
+        }
+        Err(_) => {
+            log_trmnl_success("/api/log", &firmware_headers, StatusCode::BAD_REQUEST);
+            StatusCode::BAD_REQUEST
+        }
+    }
+}
+
+fn log_trmnl_rejection(route: &str, status: StatusCode) {
+    println!("TRMNL {route} rejected: http_status={}", status.as_u16());
+}
+
+fn log_trmnl_success(route: &str, headers: &TrmnlFirmwareHeaders, status: StatusCode) {
+    match headers.telemetry_summary() {
+        Some(summary) => println!(
+            "TRMNL {route} device_id={} http_status={} {summary}",
+            headers.device_id,
+            status.as_u16()
+        ),
+        None => println!(
+            "TRMNL {route} device_id={} http_status={}",
+            headers.device_id,
+            status.as_u16()
+        ),
     }
 }
 
