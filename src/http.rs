@@ -20,6 +20,7 @@ pub fn router(state: AppState) -> Router {
             "/webhooks/whatsapp",
             get(whatsapp_verify).post(whatsapp_webhook),
         )
+        .route("/api/setup", get(trmnl_setup))
         .route("/api/display", get(trmnl_display))
         .route("/trmnl/list.png", get(trmnl_image))
         .route("/api/log", post(trmnl_log))
@@ -71,6 +72,32 @@ impl TrmnlDisplayResponse {
             firmware_url: None,
             refresh_rate: "60".to_owned(),
             reset_firmware: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TrmnlSetupResponse {
+    status: u32,
+    api_key: String,
+    friendly_id: String,
+    image_url: String,
+    filename: String,
+}
+
+impl TrmnlSetupResponse {
+    fn new(
+        api_key: impl Into<String>,
+        friendly_id: impl Into<String>,
+        image_url: impl Into<String>,
+        filename: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: 200,
+            api_key: api_key.into(),
+            friendly_id: friendly_id.into(),
+            image_url: image_url.into(),
+            filename: filename.into(),
         }
     }
 }
@@ -201,6 +228,54 @@ fn whatsapp_webhook_status(result: Result<(), WhatsAppWebhookError>) -> StatusCo
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
+}
+
+async fn trmnl_setup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<TrmnlSetupResponse>, StatusCode> {
+    acknowledge_state_shape(&state);
+    let firmware_headers = TrmnlFirmwareHeaders::from_headers(&headers)?;
+    let image_url = format!("{}/trmnl/list.png", state.config.public_base_url);
+
+    Ok(Json(TrmnlSetupResponse::new(
+        state.config.trmnl.token.as_str(),
+        trmnl_friendly_id(&firmware_headers.device_id),
+        image_url,
+        "list.png",
+    )))
+}
+
+fn trmnl_friendly_id(device_id: &str) -> String {
+    let normalized = device_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    let suffix = if normalized.is_empty() {
+        trmnl_hashed_suffix(device_id)
+    } else {
+        normalized
+            .chars()
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    };
+
+    format!("trmnl-{suffix}")
+}
+
+fn trmnl_hashed_suffix(device_id: &str) -> String {
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in device_id.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+
+    format!("{:06x}", hash & 0x00ff_ffff)
 }
 
 async fn trmnl_display(
@@ -801,6 +876,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trmnl_setup_returns_expected_setup_response_for_device_id() {
+        let state = AppState::new_uninitialized(test_config());
+        let headers = trmnl_headers_with_id("AA:BB:CC:DD:EE:FF");
+
+        let Json(response) = trmnl_setup(State(state), headers)
+            .await
+            .expect("valid setup headers should return setup response");
+        let json = serde_json::to_value(&response).expect("setup response should serialize");
+        let serialized =
+            serde_json::to_string(&response).expect("setup response should serialize to string");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "status": 200,
+                "api_key": "trmnl-secret",
+                "friendly_id": "trmnl-ddeeff",
+                "image_url": "https://example.test/trmnl/list.png",
+                "filename": "list.png",
+            })
+        );
+        assert_eq!(response.api_key, "trmnl-secret");
+        assert!(!serialized.contains("verify-secret"));
+        assert!(!serialized.contains("access-secret"));
+    }
+
+    #[test]
+    fn trmnl_friendly_id_is_deterministic_safe_suffix() {
+        let device_id = "AA:BB:CC:DD:EE:FF";
+
+        let friendly_id = trmnl_friendly_id(device_id);
+
+        assert_eq!(friendly_id, "trmnl-ddeeff");
+        assert_eq!(friendly_id, trmnl_friendly_id(device_id));
+        assert!(!friendly_id.contains(device_id));
+    }
+
+    #[tokio::test]
+    async fn trmnl_setup_rejects_missing_or_invalid_device_id() {
+        let state = AppState::new_uninitialized(test_config());
+
+        assert_eq!(
+            trmnl_setup(State(state.clone()), HeaderMap::new())
+                .await
+                .err(),
+            Some(StatusCode::BAD_REQUEST)
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "id",
+            HeaderValue::from_bytes(b"\xFF").expect("opaque header value should construct"),
+        );
+
+        assert_eq!(
+            trmnl_setup(State(state), headers).await.err(),
+            Some(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[tokio::test]
     async fn trmnl_display_returns_image_response_for_valid_firmware_headers() {
         let state = AppState::new_uninitialized(test_config());
 
@@ -1191,9 +1327,17 @@ mod tests {
         trmnl_headers_with_access_token("trmnl-secret")
     }
 
-    fn trmnl_headers_with_access_token(access_token: &str) -> HeaderMap {
+    fn trmnl_headers_with_id(device_id: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert("id", HeaderValue::from_static("device-123"));
+        headers.insert(
+            "id",
+            HeaderValue::from_str(device_id).expect("test device id should be valid"),
+        );
+        headers
+    }
+
+    fn trmnl_headers_with_access_token(access_token: &str) -> HeaderMap {
+        let mut headers = trmnl_headers_with_id("device-123");
         headers.insert(
             "access-token",
             HeaderValue::from_str(access_token).expect("test access token should be valid"),
