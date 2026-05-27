@@ -49,9 +49,8 @@ Meta must be able to reach the WhatsApp webhook over public HTTPS at:
 - `GET /webhooks/whatsapp` for webhook verification.
 - `POST /webhooks/whatsapp` for inbound message delivery.
 
-For a physical TRMNL device in BYOS mode, configure the device with the cloud
-base URL. Do not point the device at `/api/display?token=...` or at
-`/api/display` directly. Firmware 1.8.2 starts with `GET /api/setup`, then uses
+For a physical TRMNL device in BYOS mode, configure the device with the same public URL.
+Firmware 1.8.2 starts with `GET /api/setup`, then uses
 the returned API key when it fetches display metadata, the image, and telemetry.
 
 The cloud deployment must be reachable by the physical device over public HTTPS.
