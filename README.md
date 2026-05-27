@@ -1,8 +1,7 @@
 # TRMNL WhatsApp List
 
-`trmnl-whatsapp-list` is a small Rust 2024 service for one shared SQLite-backed
-text list. WhatsApp messages toggle list entries, and a TRMNL device in BYOS
-mode displays the current list.
+`trmnl-whatsapp-list` is a TRMNL BYOS service to display a SQLite-backed list.
+WhatsApp messages control the list entries.
 
 The project intentionally stays narrow: one shared list, direct SQLite startup
 initialization, official Meta WhatsApp Cloud API integration, and no migration,
