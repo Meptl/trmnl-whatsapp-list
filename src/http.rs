@@ -245,8 +245,12 @@ async fn trmnl_setup(
             return Err(status);
         }
     };
-    let image_url = format!("{}/trmnl/list.png", state.config.public_base_url);
-    let filename = trmnl_display_filename(&state.store)?;
+    let image_url = trmnl_image_url(
+        &state.config.public_base_url,
+        firmware_headers.battery_voltage.as_deref(),
+    );
+    let filename =
+        trmnl_display_filename(&state.store, firmware_headers.battery_voltage.as_deref())?;
     log_trmnl_success("/api/setup", &firmware_headers, StatusCode::OK);
 
     Ok(Json(TrmnlSetupResponse::new(
@@ -309,7 +313,8 @@ async fn trmnl_display(
         &state.config.public_base_url,
         firmware_headers.battery_voltage.as_deref(),
     );
-    let filename = trmnl_display_filename(&state.store)?;
+    let filename =
+        trmnl_display_filename(&state.store, firmware_headers.battery_voltage.as_deref())?;
     log_trmnl_success("/api/display", &firmware_headers, StatusCode::OK);
 
     Ok(Json(TrmnlDisplayResponse::new(image_url, filename)))
@@ -323,19 +328,19 @@ fn trmnl_image_url(public_base_url: &str, battery_voltage: Option<&str>) -> Stri
     }
 }
 
-fn trmnl_display_filename(store: &StoreHandle) -> Result<String, StatusCode> {
+fn trmnl_display_filename(
+    store: &StoreHandle,
+    battery_voltage: Option<&str>,
+) -> Result<String, StatusCode> {
     let entries = store
         .list_entries()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(trmnl_list_filename(&entries))
+    Ok(trmnl_list_filename(&entries, battery_voltage))
 }
 
-fn trmnl_list_filename(entries: &[Entry]) -> String {
-    if entries.is_empty() {
-        return "list-empty.png".to_owned();
-    }
-
+fn trmnl_list_filename(entries: &[Entry], battery_voltage: Option<&str>) -> String {
+    let battery = battery_filename_part(battery_voltage);
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for entry in entries {
         hash_filename_bytes(&mut hash, b"id");
@@ -346,7 +351,12 @@ fn trmnl_list_filename(entries: &[Entry]) -> String {
         hash_filename_field(&mut hash, entry.created_at().as_bytes());
     }
 
-    format!("list-{hash:016x}.png")
+    format!("list-bat{battery}-{hash:016x}.png")
+}
+
+fn battery_filename_part(battery_voltage: Option<&str>) -> String {
+    battery_fill_cells(battery_voltage)
+        .map_or_else(|| "unknown".to_owned(), |cells| cells.to_string())
 }
 
 fn hash_filename_field(hash: &mut u64, bytes: &[u8]) {
@@ -547,9 +557,9 @@ fn draw_battery_indicator(canvas: &mut Canvas, battery_voltage: Option<&str>) {
     if let Some(cells) = battery_fill_cells(battery_voltage) {
         for cell in 0..cells {
             canvas.fill_rect(
-                icon_x + 6 + (cell * 11),
+                icon_x + 7 + (cell * 14),
                 icon_y + 6,
-                8,
+                10,
                 icon_height - 12,
                 BLACK,
             );
@@ -562,11 +572,9 @@ fn draw_battery_indicator(canvas: &mut Canvas, battery_voltage: Option<&str>) {
 fn battery_fill_cells(battery_voltage: Option<&str>) -> Option<u32> {
     let percent = trmnl_og_battery_percent(battery_voltage)?;
 
-    if percent >= 75.0 {
-        Some(4)
-    } else if percent >= 50.0 {
+    if percent >= 66.0 {
         Some(3)
-    } else if percent >= 25.0 {
+    } else if percent >= 33.0 {
         Some(2)
     } else if percent > 1.0 {
         Some(1)
@@ -1134,7 +1142,7 @@ mod tests {
                 "api_key": "trmnl-secret",
                 "friendly_id": "trmnl-ddeeff",
                 "image_url": "https://example.test/trmnl/list.png",
-                "filename": "list-empty.png",
+                "filename": "list-batunknown-cbf29ce484222325.png",
             })
         );
         assert_eq!(response.api_key, "trmnl-secret");
@@ -1206,7 +1214,7 @@ mod tests {
             serde_json::json!({
                 "status": 0,
                 "image_url": "https://example.test/trmnl/list.png",
-                "filename": "list-empty.png",
+                "filename": "list-batunknown-cbf29ce484222325.png",
                 "update_firmware": false,
                 "firmware_url": null,
                 "refresh_rate": "60",

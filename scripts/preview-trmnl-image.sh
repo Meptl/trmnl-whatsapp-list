@@ -52,6 +52,7 @@ curl --show-error --silent --fail \
   "$base_url/api/display"
 
 echo "$base_url/api/display"
+echo $display_json
 
 image_url="$(jq -r '.image_url // empty' "$display_json")"
 if [ -z "$image_url" ]; then
