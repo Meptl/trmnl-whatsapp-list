@@ -20,7 +20,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/setup", get(trmnl_setup))
         .route("/api/display", get(trmnl_display))
-        .route("/trmnl/list.png", get(trmnl_image))
+        .route("/trmnl/list.png", get(trmnl_image_route))
         .route("/api/log", post(trmnl_log))
         .with_state(state)
 }
@@ -58,6 +58,11 @@ struct TrmnlDisplayResponse {
     firmware_url: Option<String>,
     refresh_rate: String,
     reset_firmware: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TrmnlImageQuery {
+    battery_voltage: Option<String>,
 }
 
 impl TrmnlDisplayResponse {
@@ -300,11 +305,22 @@ async fn trmnl_display(
         log_trmnl_success("/api/display", &firmware_headers, status);
         return Err(status);
     }
-    let image_url = format!("{}/trmnl/list.png", state.config.public_base_url);
+    let image_url = trmnl_image_url(
+        &state.config.public_base_url,
+        firmware_headers.battery_voltage.as_deref(),
+    );
     let filename = trmnl_display_filename(&state.store)?;
     log_trmnl_success("/api/display", &firmware_headers, StatusCode::OK);
 
     Ok(Json(TrmnlDisplayResponse::new(image_url, filename)))
+}
+
+fn trmnl_image_url(public_base_url: &str, battery_voltage: Option<&str>) -> String {
+    let image_url = format!("{public_base_url}/trmnl/list.png");
+    match battery_voltage.filter(|voltage| voltage.parse::<f32>().is_ok()) {
+        Some(voltage) => format!("{image_url}?battery_voltage={voltage}"),
+        None => image_url,
+    }
 }
 
 fn trmnl_display_filename(store: &StoreHandle) -> Result<String, StatusCode> {
@@ -346,8 +362,17 @@ fn hash_filename_bytes(hash: &mut u64, bytes: &[u8]) {
     }
 }
 
+async fn trmnl_image_route(
+    State(state): State<AppState>,
+    Query(query): Query<TrmnlImageQuery>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    trmnl_image(State(state), query, headers).await
+}
+
 async fn trmnl_image(
     State(state): State<AppState>,
+    query: TrmnlImageQuery,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     acknowledge_state_shape(&state);
@@ -367,7 +392,7 @@ async fn trmnl_image(
         .store
         .list_entries()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let png = render_trmnl_list_png(&entries, firmware_headers.battery_voltage.as_deref())
+    let png = render_trmnl_list_png(&entries, query.battery_voltage.as_deref())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     log_trmnl_success("/trmnl/list.png", &firmware_headers, StatusCode::OK);
 
@@ -1357,9 +1382,13 @@ mod tests {
             .add_entry("eggs")
             .expect("second entry should insert");
 
-        let response = trmnl_image(State(state), valid_trmnl_headers())
-            .await
-            .expect("valid firmware headers should return image response");
+        let response = trmnl_image(
+            State(state),
+            TrmnlImageQuery::default(),
+            valid_trmnl_headers(),
+        )
+        .await
+        .expect("valid firmware headers should return image response");
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -1380,9 +1409,13 @@ mod tests {
         let database = TestDatabase::new("trmnl_image_empty");
         let state = initialized_state(&database);
 
-        let response = trmnl_image(State(state), valid_trmnl_headers())
-            .await
-            .expect("valid firmware headers should return image response");
+        let response = trmnl_image(
+            State(state),
+            TrmnlImageQuery::default(),
+            valid_trmnl_headers(),
+        )
+        .await
+        .expect("valid firmware headers should return image response");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("image body should read");
@@ -1401,9 +1434,13 @@ mod tests {
             .add_entry("a".repeat(500))
             .expect("long entry should insert");
 
-        let response = trmnl_image(State(state), valid_trmnl_headers())
-            .await
-            .expect("valid firmware headers should return image response");
+        let response = trmnl_image(
+            State(state),
+            TrmnlImageQuery::default(),
+            valid_trmnl_headers(),
+        )
+        .await
+        .expect("valid firmware headers should return image response");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("image body should read");
@@ -1542,9 +1579,13 @@ mod tests {
         let state = AppState::new_uninitialized(test_config());
 
         assert_eq!(
-            trmnl_image(State(state), trmnl_headers_without_id())
-                .await
-                .err(),
+            trmnl_image(
+                State(state),
+                TrmnlImageQuery::default(),
+                trmnl_headers_without_id(),
+            )
+            .await
+            .err(),
             Some(StatusCode::BAD_REQUEST)
         );
     }
@@ -1554,9 +1595,13 @@ mod tests {
         let state = AppState::new_uninitialized(test_config());
 
         assert_eq!(
-            trmnl_image(State(state), trmnl_headers_without_access_token())
-                .await
-                .err(),
+            trmnl_image(
+                State(state),
+                TrmnlImageQuery::default(),
+                trmnl_headers_without_access_token(),
+            )
+            .await
+            .err(),
             Some(StatusCode::FORBIDDEN)
         );
     }
@@ -1568,7 +1613,8 @@ mod tests {
         assert_eq!(
             trmnl_image(
                 State(state),
-                trmnl_headers_with_access_token("wrong-secret")
+                TrmnlImageQuery::default(),
+                trmnl_headers_with_access_token("wrong-secret"),
             )
             .await
             .err(),
@@ -1767,7 +1813,9 @@ mod tests {
             };
         }
         if method == Method::GET && path == "/trmnl/list.png" {
-            return match trmnl_image(State(state), headers).await {
+            return match trmnl_image(State(state), trmnl_image_query_from_url(target), headers)
+                .await
+            {
                 Ok(response) => response,
                 Err(status) => status.into_response(),
             };
@@ -1788,6 +1836,18 @@ mod tests {
 
     fn route_path(target: &str) -> &str {
         target.split_once('?').map_or(target, |(path, _query)| path)
+    }
+
+    fn trmnl_image_query_from_url(target: &str) -> TrmnlImageQuery {
+        let Some((_path, query)) = target.split_once('?') else {
+            return TrmnlImageQuery::default();
+        };
+        let battery_voltage = query.split('&').find_map(|pair| {
+            pair.strip_prefix("battery_voltage=")
+                .map(std::string::ToString::to_string)
+        });
+
+        TrmnlImageQuery { battery_voltage }
     }
 
     fn trmnl_headers_with_id(device_id: &str) -> HeaderMap {

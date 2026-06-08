@@ -197,8 +197,9 @@ TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token" \
   scripts/preview-trmnl-image.sh
 ```
 
-The script defaults to `http://127.0.0.1:3000`, saves `trmnl-list.png`, and sends
-a sample `battery-voltage: 4.12` header. Override these as needed:
+The script defaults to `http://127.0.0.1:3000`, fetches `/api/display` with a
+sample `Battery-Voltage: 4.12` header, downloads the returned `image_url`, and
+saves `trmnl-list.png`. Override these as needed:
 
 ```sh
 TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token" \
