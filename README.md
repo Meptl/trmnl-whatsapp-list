@@ -188,6 +188,26 @@ TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token" \
 
 Set `DEVICE_ID` to override the default `test-device` ID header.
 
+## Local TRMNL Image Preview
+
+With the server running locally, fetch the rendered PNG and open it with `mpv`:
+
+```sh
+TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token" \
+  scripts/preview-trmnl-image.sh
+```
+
+The script defaults to `http://127.0.0.1:3000`, saves `trmnl-list.png`, and sends
+a sample `battery-voltage: 4.12` header. Override these as needed:
+
+```sh
+TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token" \
+DEVICE_ID="test-device" \
+BATTERY_VOLTAGE="3.85" \
+OUTPUT="preview.png" \
+  scripts/preview-trmnl-image.sh http://127.0.0.1:3000
+```
+
 ## Check
 
 Required verification commands:

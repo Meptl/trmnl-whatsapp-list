@@ -76,8 +76,9 @@ uses to fetch returned image URLs. Cloud deployments should bind on an address
 appropriate for the host, often `0.0.0.0:$PORT` when the platform injects
 `PORT`.
 
-Display content should stay e-ink friendly: list title, entry count, current
-entries in creation order, an empty state, and a generated timestamp.
+Display content should stay e-ink friendly: a top navigation spacer with the
+list title and battery indicator, current entries in creation order, and an
+empty state.
 
 TRMNL display, image, and log endpoints require the firmware `Access-Token`
 header to match the server-side `TRMNL_TOKEN`.

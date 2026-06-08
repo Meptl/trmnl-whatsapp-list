@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -369,7 +367,8 @@ async fn trmnl_image(
         .store
         .list_entries()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let png = render_trmnl_list_png(&entries).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let png = render_trmnl_list_png(&entries, firmware_headers.battery_voltage.as_deref())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     log_trmnl_success("/trmnl/list.png", &firmware_headers, StatusCode::OK);
 
     Response::builder()
@@ -443,25 +442,19 @@ const FONT_SPACING: u32 = 2;
 const LINE_HEIGHT: u32 = FONT_HEIGHT * FONT_SCALE + 9;
 const BLACK: [u8; 4] = [0, 0, 0, 255];
 const WHITE: [u8; 4] = [255, 255, 255, 255];
-const LIGHT_GRAY: [u8; 4] = [224, 224, 224, 255];
 
-fn render_trmnl_list_png(entries: &[crate::store::Entry]) -> Result<Vec<u8>, image::ImageError> {
+fn render_trmnl_list_png(
+    entries: &[crate::store::Entry],
+    battery_voltage: Option<&str>,
+) -> Result<Vec<u8>, image::ImageError> {
     let mut canvas = Canvas::new(TRMNL_IMAGE_WIDTH, TRMNL_IMAGE_HEIGHT, WHITE);
-    let generated_at = generated_timestamp();
-    let entry_count = format!("{} entries", entries.len());
 
     canvas.draw_text("List", TRMNL_MARGIN, 24, 8, BLACK);
-    canvas.draw_text(&entry_count, TRMNL_MARGIN, 78, 3, BLACK);
-    canvas.draw_horizontal_line(
-        TRMNL_MARGIN,
-        112,
-        TRMNL_IMAGE_WIDTH - TRMNL_MARGIN,
-        LIGHT_GRAY,
-    );
+    draw_battery_indicator(&mut canvas, battery_voltage);
 
     let max_chars = chars_per_line(TRMNL_IMAGE_WIDTH - (TRMNL_MARGIN * 2), FONT_SCALE);
-    let footer_y = TRMNL_IMAGE_HEIGHT - 42;
-    let mut y = 130;
+    let footer_y = TRMNL_IMAGE_HEIGHT - TRMNL_MARGIN;
+    let mut y = 118;
 
     if entries.is_empty() {
         canvas.draw_text("No entries", TRMNL_MARGIN, y, FONT_SCALE, BLACK);
@@ -498,14 +491,6 @@ fn render_trmnl_list_png(entries: &[crate::store::Entry]) -> Result<Vec<u8>, ima
         }
     }
 
-    canvas.draw_horizontal_line(
-        TRMNL_MARGIN,
-        footer_y - 14,
-        TRMNL_IMAGE_WIDTH - TRMNL_MARGIN,
-        LIGHT_GRAY,
-    );
-    canvas.draw_text(&generated_at, TRMNL_MARGIN, footer_y, 3, BLACK);
-
     let mut png = Vec::new();
     let encoder = image::codecs::png::PngEncoder::new(&mut png);
     encoder.write_image(
@@ -518,13 +503,68 @@ fn render_trmnl_list_png(entries: &[crate::store::Entry]) -> Result<Vec<u8>, ima
     Ok(png)
 }
 
-fn generated_timestamp() -> String {
-    let seconds = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_secs(),
-        Err(_) => 0,
-    };
+fn draw_battery_indicator(canvas: &mut Canvas, battery_voltage: Option<&str>) {
+    let icon_width = 54;
+    let icon_height = 24;
+    let terminal_width = 6;
+    let icon_x = TRMNL_IMAGE_WIDTH - TRMNL_MARGIN - icon_width - terminal_width;
+    let icon_y = 34;
 
-    format!("Generated: {seconds}s since Unix epoch")
+    canvas.draw_rect_outline(icon_x, icon_y, icon_width, icon_height, 3, BLACK);
+    canvas.fill_rect(
+        icon_x + icon_width,
+        icon_y + 7,
+        terminal_width,
+        icon_height - 14,
+        BLACK,
+    );
+
+    if let Some(cells) = battery_fill_cells(battery_voltage) {
+        for cell in 0..cells {
+            canvas.fill_rect(
+                icon_x + 6 + (cell * 11),
+                icon_y + 6,
+                8,
+                icon_height - 12,
+                BLACK,
+            );
+        }
+    } else {
+        canvas.draw_text("?", icon_x + 22, icon_y + 4, 3, BLACK);
+    }
+}
+
+fn battery_fill_cells(battery_voltage: Option<&str>) -> Option<u32> {
+    let percent = trmnl_og_battery_percent(battery_voltage)?;
+
+    if percent >= 75.0 {
+        Some(4)
+    } else if percent >= 50.0 {
+        Some(3)
+    } else if percent >= 25.0 {
+        Some(2)
+    } else if percent > 1.0 {
+        Some(1)
+    } else {
+        Some(0)
+    }
+}
+
+fn trmnl_og_battery_percent(battery_voltage: Option<&str>) -> Option<f32> {
+    let voltage = battery_voltage?.parse::<f32>().ok()?;
+    let percent = (voltage - 3.0) / 0.012;
+
+    if percent >= 88.0 {
+        Some(100.0)
+    } else if percent >= 85.0 {
+        Some(95.0)
+    } else if percent >= 83.0 {
+        Some(90.0)
+    } else if percent >= 10.0 {
+        Some(percent)
+    } else {
+        Some(1.0)
+    }
 }
 
 fn chars_per_line(width: u32, scale: u32) -> usize {
@@ -650,9 +690,19 @@ impl Canvas {
         }
     }
 
-    fn draw_horizontal_line(&mut self, x1: u32, y: u32, x2: u32, color: [u8; 4]) {
-        let width = x2.saturating_sub(x1);
-        self.fill_rect(x1, y, width, 2, color);
+    fn draw_rect_outline(
+        &mut self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        stroke: u32,
+        color: [u8; 4],
+    ) {
+        self.fill_rect(x, y, width, stroke, color);
+        self.fill_rect(x, y + height - stroke, width, stroke, color);
+        self.fill_rect(x, y, stroke, height, color);
+        self.fill_rect(x + width - stroke, y, stroke, height, color);
     }
 
     fn fill_rect(&mut self, x: u32, y: u32, width: u32, height: u32, color: [u8; 4]) {
