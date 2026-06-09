@@ -189,6 +189,13 @@ Telegram should POST the update to `/webhooks/telegram`; the service validates
 the secret header, authorizes the sender, then accepts later list mutations and
 replies with `sendMessage`.
 
+For group chats, disable the bot's BotFather privacy mode if you want plain item
+messages such as `Moo` to update the list. With privacy mode enabled, Telegram
+usually delivers commands like `/login`, replies to the bot, and mentions, but
+not regular group messages; the service cannot process messages Telegram does
+not send to the webhook. In BotFather, use `/setprivacy`, choose the bot, and
+select `Disable`.
+
 Telegram mode handles normal `message.text` updates from any chat type delivered
 to the bot. Edited messages, channel posts, non-text updates, and incomplete
 updates are ignored.

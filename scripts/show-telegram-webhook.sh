@@ -27,7 +27,14 @@ print_json() {
 }
 
 echo "== Bot identity: getMe =="
-curl --show-error --silent --fail "$api_base/getMe" | print_json
+bot_identity="$(curl --show-error --silent --fail "$api_base/getMe")"
+printf '%s\n' "$bot_identity" | print_json
+
+if command -v jq >/dev/null 2>&1 && [ "$(printf '%s\n' "$bot_identity" | jq -r '.result.can_read_all_group_messages // false')" = "false" ]; then
+  echo
+  echo "Note: BotFather privacy mode appears enabled. Plain group messages are not delivered to the bot in this mode."
+  echo "Use BotFather /setprivacy, choose this bot, and select Disable if group item messages should update the list."
+fi
 
 echo
 echo "== Webhook information: getWebhookInfo =="
