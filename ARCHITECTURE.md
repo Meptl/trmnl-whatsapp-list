@@ -3,8 +3,9 @@
 ## Purpose
 
 `trmnl-whatsapp-list` is a small Rust 2024 service for one shared list of text
-entries. It is designed so WhatsApp messages toggle list entries, and a TRMNL
-device in BYOS mode displays the current list.
+entries. It is designed so messages from exactly one active provider, WhatsApp or
+Telegram, toggle list entries, and a TRMNL device in BYOS mode displays the
+current list.
 
 The service intentionally avoids migrations, multi-list modeling, provider
 fallbacks, and backward compatibility layers.
@@ -14,7 +15,9 @@ fallbacks, and backward compatibility layers.
 The implemented foundation currently includes:
 
 - Crate-level `#![forbid(unsafe_code)]`.
-- Runtime configuration loaded from environment variables.
+- Runtime configuration loaded from environment variables, including
+  WhatsApp-or-Telegram provider selection with Telegram preferred when both are
+  configured.
 - Secret wrapper debug output that redacts token values.
 - Axum startup that loads configuration, initializes application state, binds
   `BIND_ADDR`, and serves requests.
@@ -26,6 +29,9 @@ The implemented foundation currently includes:
 - WhatsApp Cloud API webhook payload parsing for inbound text messages.
 - Meta Graph API text reply request construction and sending through the
   WhatsApp webhook POST flow.
+- Telegram Bot API webhook parsing for normal `message.text` updates.
+- Telegram Bot API `sendMessage` reply request construction and sending through
+  the Telegram webhook POST flow.
 - TRMNL BYOS setup response generation.
 - TRMNL BYOS display response generation.
 - TRMNL 800x480 PNG rendering for the current list.
@@ -35,13 +41,20 @@ The implemented foundation currently includes:
 
 Configuration is owned by `src/config.rs`.
 
-Required environment variables:
+Required common environment variables:
 
-- `WHATSAPP_VERIFY_TOKEN`
-- `WHATSAPP_ACCESS_TOKEN`
-- `WHATSAPP_PHONE_NUMBER_ID`
+- `WEBHOOK_KEY`
 - `TRMNL_TOKEN`
 - `PUBLIC_BASE_URL`
+
+Required WhatsApp mode variables:
+
+- `WHATSAPP_ACCESS_TOKEN`
+- `WHATSAPP_PHONE_NUMBER_ID`
+
+Required Telegram mode variables:
+
+- `TELEGRAM_BOT_TOKEN`
 
 Optional environment variables:
 
@@ -57,8 +70,10 @@ deployment because display responses use it to build the device-fetchable image
 URL. `BIND_ADDR` should match the hosting platform; cloud hosts often require
 `0.0.0.0:$PORT` when they inject `PORT`.
 
-Missing required variables return `ConfigError::MissingRequiredVariable` with
-the variable name. Invalid Unicode in environment keys or values returns
+Missing common required variables return `ConfigError::MissingRequiredVariable`
+with the variable name. Provider inference prefers Telegram when both provider
+groups are configured and returns typed errors for missing or incomplete
+provider groups. Invalid Unicode in environment keys or values returns
 `ConfigError::InvalidUnicode`. Secret values are stored in `SecretString`, whose
 `Debug` implementation prints only `[redacted]`.
 
@@ -71,13 +86,15 @@ The service is split into these responsibilities:
 
 - Startup loads `AppConfig`, initializes `AppState`, builds the Axum router,
   binds `BIND_ADDR`, and serves requests.
-- `AppState` owns shared configuration, a SQLite store handle, and a WhatsApp
-  reply client.
+- `AppState` owns shared configuration, a SQLite store handle, and the active
+  provider reply client.
 - Persistence uses `rusqlite` directly against `DATABASE_PATH` and initializes
   the schema with `CREATE TABLE IF NOT EXISTS`.
-- Message interpretation and execution stay independent of WhatsApp payload shapes,
-  Meta transport, and HTTP handlers.
+- Message interpretation and execution stay independent of provider payload
+  shapes, provider transports, and HTTP handlers.
 - WhatsApp integration targets the official Meta WhatsApp Cloud API only.
+- Telegram integration targets the official Telegram Bot API only.
+- Only the active provider webhook route is registered; when both provider credential groups are configured, Telegram is active.
 - TRMNL integration exposes BYOS display, PNG image, and telemetry endpoints.
 
 ## Data Model
@@ -105,26 +122,31 @@ and validation.
 
 ## HTTP Surface
 
-The Axum routes are:
-
-- `GET /webhooks/whatsapp`
-- `POST /webhooks/whatsapp`
+The common Axum routes are:
 - `GET /api/setup`
 - `GET /api/display`
 - `GET /trmnl/list.png`
 - `POST /api/log`
 
+Provider routes are active-provider dependent:
+
+- WhatsApp mode: `GET /webhooks/whatsapp` and `POST /webhooks/whatsapp`
+- Telegram mode: `POST /webhooks/telegram`
+
 TRMNL display, image, and log endpoints require firmware headers. `ID` is
 required for all TRMNL BYOS endpoints. `Access-Token` is required for display,
 image, and log requests and must match the server-side `TRMNL_TOKEN`.
-WhatsApp verification compares Meta's `hub.verify_token` against
-`WHATSAPP_VERIFY_TOKEN` and returns the provided challenge only on a match.
+WhatsApp verification compares Meta's `hub.verify_token` against `WEBHOOK_KEY`
+and returns the provided challenge only on a match. Telegram webhook handling
+requires `X-Telegram-Bot-Api-Secret-Token` to match `WEBHOOK_KEY`.
 
 Handler behavior:
 
 - `GET /webhooks/whatsapp` verifies Meta's challenge.
 - `POST /webhooks/whatsapp` parses inbound text messages, toggles matching list
   entries, logs reply text, and sends replies.
+- `POST /webhooks/telegram` parses normal `message.text` updates, toggles
+  matching list entries, logs reply text, and sends replies.
 - `GET /api/setup` returns TRMNL setup JSON with `api_key`, `friendly_id`,
   `image_url`, and `filename`.
 - `GET /api/display` returns TRMNL display JSON containing the list PNG URL.
@@ -145,12 +167,17 @@ the setup endpoint, and subsequent display requests use header authentication.
 An implementation that only accepts `/api/display?token=...` does not satisfy
 the physical-device flow.
 
-## WhatsApp Components
+## Messaging Components
 
 WhatsApp payload parsing accepts Meta webhook JSON and extracts inbound text
 messages with sender, message id, and text body. Non-text messages, status-only
 payloads, incomplete text messages, and unsupported top-level shapes do not
 produce list changes.
+
+Telegram payload parsing accepts Bot API Update JSON and extracts normal
+`message.text` updates with chat id, message id, and text. Edited messages,
+channel posts, non-text messages, incomplete messages, and unsupported top-level
+shapes do not produce list changes.
 
 The reply client targets:
 
@@ -159,9 +186,18 @@ The reply client targets:
 It sends text replies with bearer authentication from `WHATSAPP_ACCESS_TOKEN`.
 Debug output intentionally omits the access token.
 
+The Telegram reply client targets:
+
+```text
+https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage
+```
+
+It sends JSON text replies with `chat_id` and `text`. Debug output intentionally
+omits the bot token.
+
 ## Message Behavior
 
-Non-empty inbound text toggles the matching list entry:
+Non-empty inbound text from either provider toggles the matching list entry:
 
 - if the trimmed text is absent, add it and reply `"text" added to list.`
 - if the trimmed text is present, remove it and reply `"text" removed from list.`

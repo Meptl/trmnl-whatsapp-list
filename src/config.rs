@@ -4,9 +4,10 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 
-const WHATSAPP_VERIFY_TOKEN: &str = "WHATSAPP_VERIFY_TOKEN";
-const WHATSAPP_ACCESS_TOKEN: &str = "WHATSAPP_ACCESS_TOKEN";
-const WHATSAPP_PHONE_NUMBER_ID: &str = "WHATSAPP_PHONE_NUMBER_ID";
+pub const WEBHOOK_KEY: &str = "WEBHOOK_KEY";
+pub const WHATSAPP_ACCESS_TOKEN: &str = "WHATSAPP_ACCESS_TOKEN";
+pub const WHATSAPP_PHONE_NUMBER_ID: &str = "WHATSAPP_PHONE_NUMBER_ID";
+pub const TELEGRAM_BOT_TOKEN: &str = "TELEGRAM_BOT_TOKEN";
 const TRMNL_TOKEN: &str = "TRMNL_TOKEN";
 const PUBLIC_BASE_URL: &str = "PUBLIC_BASE_URL";
 const DATABASE_PATH: &str = "DATABASE_PATH";
@@ -17,7 +18,8 @@ const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
 
 #[derive(Clone)]
 pub struct AppConfig {
-    pub whatsapp: WhatsAppConfig,
+    pub webhook_key: SecretString,
+    pub messaging_provider: MessagingProviderConfig,
     pub trmnl: TrmnlConfig,
     pub public_base_url: String,
     pub database_path: PathBuf,
@@ -25,10 +27,20 @@ pub struct AppConfig {
 }
 
 #[derive(Clone)]
+pub enum MessagingProviderConfig {
+    WhatsApp(WhatsAppConfig),
+    Telegram(TelegramConfig),
+}
+
+#[derive(Clone)]
 pub struct WhatsAppConfig {
-    pub verify_token: SecretString,
     pub access_token: SecretString,
     pub phone_number_id: String,
+}
+
+#[derive(Clone)]
+pub struct TelegramConfig {
+    pub bot_token: SecretString,
 }
 
 #[derive(Clone)]
@@ -61,7 +73,8 @@ impl fmt::Debug for AppConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AppConfig")
-            .field("whatsapp", &self.whatsapp)
+            .field("webhook_key", &self.webhook_key)
+            .field("messaging_provider", &self.messaging_provider)
             .field("trmnl", &self.trmnl)
             .field("public_base_url", &self.public_base_url)
             .field("database_path", &self.database_path)
@@ -70,13 +83,36 @@ impl fmt::Debug for AppConfig {
     }
 }
 
+impl fmt::Debug for MessagingProviderConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WhatsApp(config) => formatter
+                .debug_tuple("MessagingProviderConfig::WhatsApp")
+                .field(config)
+                .finish(),
+            Self::Telegram(config) => formatter
+                .debug_tuple("MessagingProviderConfig::Telegram")
+                .field(config)
+                .finish(),
+        }
+    }
+}
+
 impl fmt::Debug for WhatsAppConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WhatsAppConfig")
-            .field("verify_token", &self.verify_token)
             .field("access_token", &self.access_token)
             .field("phone_number_id", &self.phone_number_id)
+            .finish()
+    }
+}
+
+impl fmt::Debug for TelegramConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TelegramConfig")
+            .field("bot_token", &self.bot_token)
             .finish()
     }
 }
@@ -94,6 +130,8 @@ impl fmt::Debug for TrmnlConfig {
 pub enum ConfigError {
     MissingRequiredVariable { variable: &'static str },
     InvalidUnicode { variable: String },
+    MissingMessagingProvider,
+    IncompleteMessagingProvider { provider: &'static str },
 }
 
 impl fmt::Display for ConfigError {
@@ -109,6 +147,17 @@ impl fmt::Display for ConfigError {
                 write!(
                     formatter,
                     "environment variable {variable} contains invalid unicode"
+                )
+            }
+            Self::MissingMessagingProvider => write!(
+                formatter,
+                "missing messaging provider configuration for WhatsApp or Telegram"
+            ),
+
+            Self::IncompleteMessagingProvider { provider } => {
+                write!(
+                    formatter,
+                    "incomplete {provider} messaging provider configuration"
                 )
             }
         }
@@ -128,11 +177,8 @@ impl AppConfig {
         let source = EnvSource::new(pairs)?;
 
         Ok(Self {
-            whatsapp: WhatsAppConfig {
-                verify_token: SecretString(source.required(WHATSAPP_VERIFY_TOKEN)?),
-                access_token: SecretString(source.required(WHATSAPP_ACCESS_TOKEN)?),
-                phone_number_id: source.required(WHATSAPP_PHONE_NUMBER_ID)?,
-            },
+            webhook_key: SecretString(source.required(WEBHOOK_KEY)?),
+            messaging_provider: messaging_provider_from_source(&source)?,
             trmnl: TrmnlConfig {
                 token: SecretString(source.required(TRMNL_TOKEN)?),
             },
@@ -146,6 +192,33 @@ impl AppConfig {
                 .optional(BIND_ADDR)?
                 .unwrap_or(DEFAULT_BIND_ADDR.to_owned()),
         })
+    }
+}
+
+fn messaging_provider_from_source(
+    source: &EnvSource,
+) -> Result<MessagingProviderConfig, ConfigError> {
+    let whatsapp_access_token = source.optional(WHATSAPP_ACCESS_TOKEN)?;
+    let whatsapp_phone_number_id = source.optional(WHATSAPP_PHONE_NUMBER_ID)?;
+    let telegram_bot_token = source.optional(TELEGRAM_BOT_TOKEN)?;
+
+    if let Some(bot_token) = telegram_bot_token {
+        return Ok(MessagingProviderConfig::Telegram(TelegramConfig {
+            bot_token: SecretString(bot_token),
+        }));
+    }
+
+    match (whatsapp_access_token, whatsapp_phone_number_id) {
+        (Some(access_token), Some(phone_number_id)) => {
+            Ok(MessagingProviderConfig::WhatsApp(WhatsAppConfig {
+                access_token: SecretString(access_token),
+                phone_number_id,
+            }))
+        }
+        (None, None) => Err(ConfigError::MissingMessagingProvider),
+        _ => Err(ConfigError::IncompleteMessagingProvider {
+            provider: "WhatsApp",
+        }),
     }
 }
 
@@ -195,21 +268,30 @@ fn into_string(value: OsString, variable: String) -> Result<String, ConfigError>
 mod tests {
     use super::*;
 
-    const REQUIRED_ENV: [(&str, &str); 5] = [
-        (WHATSAPP_VERIFY_TOKEN, "verify-secret"),
-        (WHATSAPP_ACCESS_TOKEN, "access-secret"),
-        (WHATSAPP_PHONE_NUMBER_ID, "phone-number"),
+    const COMMON_ENV: [(&str, &str); 3] = [
+        (WEBHOOK_KEY, "webhook-secret"),
         (TRMNL_TOKEN, "trmnl-secret"),
         (PUBLIC_BASE_URL, "https://example.test"),
     ];
 
-    #[test]
-    fn loads_required_values_and_defaults() {
-        let config = AppConfig::from_pairs(REQUIRED_ENV).expect("config should load");
+    const WHATSAPP_ENV: [(&str, &str); 2] = [
+        (WHATSAPP_ACCESS_TOKEN, "access-secret"),
+        (WHATSAPP_PHONE_NUMBER_ID, "phone-number"),
+    ];
 
-        assert_eq!(config.whatsapp.verify_token.as_str(), "verify-secret");
-        assert_eq!(config.whatsapp.access_token.as_str(), "access-secret");
-        assert_eq!(config.whatsapp.phone_number_id, "phone-number");
+    const TELEGRAM_ENV: [(&str, &str); 1] = [(TELEGRAM_BOT_TOKEN, "bot-secret")];
+
+    #[test]
+    fn loads_whatsapp_required_values_and_defaults() {
+        let config = AppConfig::from_pairs(COMMON_ENV.into_iter().chain(WHATSAPP_ENV))
+            .expect("config should load");
+
+        assert_eq!(config.webhook_key.as_str(), "webhook-secret");
+        let MessagingProviderConfig::WhatsApp(whatsapp) = config.messaging_provider else {
+            panic!("WhatsApp config should load");
+        };
+        assert_eq!(whatsapp.access_token.as_str(), "access-secret");
+        assert_eq!(whatsapp.phone_number_id, "phone-number");
         assert_eq!(config.trmnl.token.as_str(), "trmnl-secret");
         assert_eq!(config.public_base_url, "https://example.test");
         assert_eq!(config.database_path, PathBuf::from(DEFAULT_DATABASE_PATH));
@@ -217,10 +299,22 @@ mod tests {
     }
 
     #[test]
+    fn loads_telegram_required_values() {
+        let config = AppConfig::from_pairs(COMMON_ENV.into_iter().chain(TELEGRAM_ENV))
+            .expect("config should load");
+
+        let MessagingProviderConfig::Telegram(telegram) = config.messaging_provider else {
+            panic!("Telegram config should load");
+        };
+        assert_eq!(telegram.bot_token.as_str(), "bot-secret");
+    }
+
+    #[test]
     fn optional_values_override_defaults() {
         let config = AppConfig::from_pairs(
-            REQUIRED_ENV
+            COMMON_ENV
                 .into_iter()
+                .chain(WHATSAPP_ENV)
                 .chain([(DATABASE_PATH, "/tmp/list.db"), (BIND_ADDR, "0.0.0.0:8080")]),
         )
         .expect("config should load");
@@ -230,32 +324,99 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_values_name_the_variable() {
-        let error = AppConfig::from_pairs([(WHATSAPP_ACCESS_TOKEN, "access-secret")]).unwrap_err();
+    fn missing_common_required_values_name_the_variable() {
+        let error = AppConfig::from_pairs(WHATSAPP_ENV).unwrap_err();
 
         assert_eq!(
             error,
             ConfigError::MissingRequiredVariable {
-                variable: WHATSAPP_VERIFY_TOKEN
+                variable: WEBHOOK_KEY
             }
         );
-        assert!(error.to_string().contains(WHATSAPP_VERIFY_TOKEN));
+        assert!(error.to_string().contains(WEBHOOK_KEY));
+    }
+
+    #[test]
+    fn missing_provider_group_fails() {
+        let error = AppConfig::from_pairs(COMMON_ENV).unwrap_err();
+
+        assert_eq!(error, ConfigError::MissingMessagingProvider);
+    }
+
+    #[test]
+    fn telegram_provider_is_preferred_when_both_provider_groups_exist() {
+        let config = AppConfig::from_pairs(
+            COMMON_ENV
+                .into_iter()
+                .chain(WHATSAPP_ENV)
+                .chain(TELEGRAM_ENV),
+        )
+        .expect("config should load");
+
+        let MessagingProviderConfig::Telegram(telegram) = config.messaging_provider else {
+            panic!("Telegram config should be preferred");
+        };
+        assert_eq!(telegram.bot_token.as_str(), "bot-secret");
+    }
+
+    #[test]
+    fn telegram_provider_is_preferred_over_incomplete_whatsapp_group() {
+        let config = AppConfig::from_pairs(
+            COMMON_ENV
+                .into_iter()
+                .chain([(WHATSAPP_ACCESS_TOKEN, "access-secret")])
+                .chain(TELEGRAM_ENV),
+        )
+        .expect("config should load");
+
+        let MessagingProviderConfig::Telegram(telegram) = config.messaging_provider else {
+            panic!("Telegram config should be preferred");
+        };
+        assert_eq!(telegram.bot_token.as_str(), "bot-secret");
+    }
+
+    #[test]
+    fn incomplete_whatsapp_provider_group_fails() {
+        let error = AppConfig::from_pairs(
+            COMMON_ENV
+                .into_iter()
+                .chain([(WHATSAPP_ACCESS_TOKEN, "access-secret")]),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            ConfigError::IncompleteMessagingProvider {
+                provider: "WhatsApp"
+            }
+        );
+    }
+
+    #[test]
+    fn whatsapp_verify_token_is_not_a_provider_alias() {
+        let error = AppConfig::from_pairs(
+            COMMON_ENV
+                .into_iter()
+                .chain([("WHATSAPP_VERIFY_TOKEN", "old-secret")]),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, ConfigError::MissingMessagingProvider);
     }
 
     #[test]
     fn secrets_are_redacted_in_debug_output() {
-        let config = AppConfig::from_pairs(REQUIRED_ENV).expect("config should load");
+        let config = AppConfig::from_pairs(COMMON_ENV.into_iter().chain(WHATSAPP_ENV))
+            .expect("config should load");
 
-        assert_eq!(format!("{:?}", config.whatsapp.verify_token), "[redacted]");
-        assert!(!format!("{:?}", config.whatsapp.verify_token).contains("verify-secret"));
+        assert_eq!(format!("{:?}", config.webhook_key), "[redacted]");
+        assert!(!format!("{config:?}").contains("webhook-secret"));
+        assert!(!format!("{config:?}").contains("access-secret"));
     }
 
     #[test]
     fn invalid_unicode_errors_do_not_include_values() {
-        let result = EnvSource::new([(
-            OsString::from(WHATSAPP_VERIFY_TOKEN),
-            invalid_unicode_os_string(),
-        )]);
+        let result = EnvSource::new([(OsString::from(WEBHOOK_KEY), invalid_unicode_os_string())]);
         let Err(error) = result else {
             panic!("invalid unicode should produce a config error");
         };
@@ -263,8 +424,8 @@ mod tests {
         let debug = format!("{error:?}");
         let display = error.to_string();
 
-        assert!(debug.contains(WHATSAPP_VERIFY_TOKEN));
-        assert!(display.contains(WHATSAPP_VERIFY_TOKEN));
+        assert!(debug.contains(WEBHOOK_KEY));
+        assert!(display.contains(WEBHOOK_KEY));
     }
 
     #[cfg(unix)]

@@ -1,7 +1,7 @@
 # TRMNL WhatsApp List
 
 `trmnl-whatsapp-list` is a TRMNL BYOS service to display a SQLite-backed list.
-WhatsApp messages control the list entries.
+One active messaging provider controls the list entries: WhatsApp or Telegram.
 
 The project intentionally stays narrow: one shared list, direct SQLite startup
 initialization, official Meta WhatsApp Cloud API integration, and no migration,
@@ -16,10 +16,14 @@ Implemented:
 - SQLite `entries` table initialization and list operations.
 - Message text toggling that adds missing entries and removes existing entries.
 - Slash commands for `/list` and `/clear`.
+- Runtime configuration for WhatsApp or Telegram, with Telegram preferred when both provider groups are configured.
 - WhatsApp webhook verification for `GET /webhooks/whatsapp`.
 - WhatsApp payload parsing for inbound text messages.
 - Meta Graph API text reply client.
-- WhatsApp list updates and replies for `POST /webhooks/whatsapp`.
+- Telegram webhook secret validation for `POST /webhooks/telegram`.
+- Telegram update parsing for inbound text messages.
+- Telegram Bot API `sendMessage` reply client.
+- Messaging list updates and replies for the active provider webhook.
 - TRMNL BYOS display metadata at `GET /api/display`.
 - TRMNL BYOS setup handshake at `GET /api/setup`.
 - TRMNL list PNG rendering at `GET /trmnl/list.png`.
@@ -34,8 +38,8 @@ Implemented:
 - A WhatsApp Business phone number ID for that app.
 - A long-lived or permanent Meta access token that can send messages for that
   phone number.
-- A webhook verify token chosen by the operator.
-- A public HTTPS URL for Meta webhook delivery.
+- A webhook key chosen by the operator. In WhatsApp mode it is the Meta verify token; in Telegram mode it is the Telegram webhook `secret_token`.
+- A public HTTPS URL for active-provider webhook delivery.
 - A TRMNL device configured for BYOS mode.
 - A server-side TRMNL token chosen by the operator.
 
@@ -44,10 +48,16 @@ Implemented:
 Run the service on a local machine, VPS, Raspberry Pi, NAS, or similar host that
 can keep a Rust service and SQLite database running.
 
-Meta must be able to reach the WhatsApp webhook over public HTTPS at:
+The deployment runs one active messaging provider. If both Telegram and WhatsApp credentials are present, Telegram is active.
+
+In WhatsApp mode, Meta must be able to reach:
 
 - `GET /webhooks/whatsapp` for webhook verification.
 - `POST /webhooks/whatsapp` for inbound message delivery.
+
+In Telegram mode, Telegram must be configured to deliver bot updates to:
+
+- `POST /webhooks/telegram` for inbound message delivery.
 
 For a physical TRMNL device in BYOS mode, configure the device with the same public URL.
 Firmware 1.8.2 starts with `GET /api/setup`, then uses
@@ -60,19 +70,33 @@ value, and the device must be able to fetch those URLs.
 
 ## Configuration
 
-Required environment variables:
+Required common environment variables:
 
-- `WHATSAPP_VERIFY_TOKEN`: operator-chosen token configured in the Meta webhook
-  subscription and compared during verification.
-- `WHATSAPP_ACCESS_TOKEN`: Meta Graph API bearer token used to send WhatsApp
-  replies.
-- `WHATSAPP_PHONE_NUMBER_ID`: WhatsApp Business phone number ID used in the Meta
-  send-message URL.
+- `WEBHOOK_KEY`: operator-chosen webhook secret. In WhatsApp mode, configure this
+  value as Meta's webhook verify token. In Telegram mode, use it as the Telegram
+  webhook `secret_token`; choose only `A-Z`, `a-z`, `0-9`, `_`, and `-` for
+  Telegram compatibility.
 - `TRMNL_TOKEN`: server-side token returned by `GET /api/setup` as `api_key`.
   The operator does not type this token into the device. Firmware sends it back
   on later requests as the `Access-Token` header.
 - `PUBLIC_BASE_URL`: externally reachable HTTPS base URL used when returning
   TRMNL image URLs to the physical device.
+
+Required WhatsApp mode variables:
+
+- `WHATSAPP_ACCESS_TOKEN`: Meta Graph API bearer token used to send WhatsApp
+  replies.
+- `WHATSAPP_PHONE_NUMBER_ID`: WhatsApp Business phone number ID used in the Meta
+  send-message URL.
+
+Required Telegram mode variables:
+
+- `TELEGRAM_BOT_TOKEN`: Bot API token for an operator-created Telegram bot.
+
+Set at least one provider group. When both provider groups are configured,
+Telegram is preferred and WhatsApp credentials are ignored. Startup fails if no
+provider group is configured or the active WhatsApp group is incomplete.
+`WHATSAPP_VERIFY_TOKEN` is not supported; use `WEBHOOK_KEY`.
 
 Optional environment variables:
 
@@ -84,9 +108,20 @@ Optional environment variables:
 Example local setup with placeholder values:
 
 ```sh
-export WHATSAPP_VERIFY_TOKEN="replace-with-operator-chosen-verify-token"
+export WEBHOOK_KEY="replace-with-operator-chosen-webhook-key"
 export WHATSAPP_ACCESS_TOKEN="replace-with-meta-access-token"
 export WHATSAPP_PHONE_NUMBER_ID="replace-with-meta-phone-number-id"
+export TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token"
+export PUBLIC_BASE_URL="https://example.test"
+export DATABASE_PATH="list.db"
+export BIND_ADDR="127.0.0.1:3000"
+```
+
+Example Telegram setup with placeholder values:
+
+```sh
+export WEBHOOK_KEY="replace-with-telegram-compatible-webhook-key"
+export TELEGRAM_BOT_TOKEN="replace-with-botfather-token"
 export TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token"
 export PUBLIC_BASE_URL="https://example.test"
 export DATABASE_PATH="list.db"
@@ -104,6 +139,54 @@ WhatsApp replies are sent through the Meta Graph API endpoint:
 ```text
 https://graph.facebook.com/v23.0/{WHATSAPP_PHONE_NUMBER_ID}/messages
 ```
+
+## Telegram Setup
+
+Create a bot with BotFather, copy its bot token into `TELEGRAM_BOT_TOKEN`, and
+set this service as the bot webhook. `PUBLIC_BASE_URL` must be a public HTTPS
+base URL reachable by Telegram, not `localhost`.
+
+With the required Telegram-mode environment variables exported, run:
+
+```sh
+scripts/setup-telegram-webhook.sh
+```
+
+The script registers:
+
+- webhook URL: `$PUBLIC_BASE_URL/webhooks/telegram`
+- webhook secret: `$WEBHOOK_KEY`, sent by Telegram as
+  `X-Telegram-Bot-Api-Secret-Token`
+- allowed updates: `message`
+
+Set `DROP_PENDING_UPDATES=true` if you want Telegram to discard queued updates
+while registering the webhook:
+
+```sh
+DROP_PENDING_UPDATES=true scripts/setup-telegram-webhook.sh
+```
+
+To inspect the bot identity and current webhook status returned by Telegram:
+
+```sh
+scripts/show-telegram-webhook.sh
+```
+
+Equivalent manual command:
+
+```sh
+curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
+  -H "Content-Type: application/json" \
+  --data-binary "{\"url\":\"$PUBLIC_BASE_URL/webhooks/telegram\",\"secret_token\":\"$WEBHOOK_KEY\",\"allowed_updates\":[\"message\"]}"
+```
+
+After registration, message the bot in Telegram. Telegram should POST the update
+to `/webhooks/telegram`; the service validates the secret header, mutates the
+list, and replies with `sendMessage`.
+
+Telegram mode handles normal `message.text` updates from any chat type delivered
+to the bot. Edited messages, channel posts, non-text updates, and incomplete
+updates are ignored.
 
 ## Run
 
@@ -130,7 +213,14 @@ scripts/send-local-whatsapp-webhook.sh http://127.0.0.1:4000
 ```
 
 The webhook handler sends a WhatsApp reply through Meta as part of normal
-processing, so a local run still depends on the configured Meta credentials.
+processing, so a local WhatsApp-mode run still depends on the configured Meta
+credentials. In Telegram mode, post valid Telegram update JSON to
+`/webhooks/telegram` with `X-Telegram-Bot-Api-Secret-Token: $WEBHOOK_KEY`:
+
+```sh
+WEBHOOK_KEY="replace-with-telegram-webhook-secret" \
+  scripts/send-local-telegram-webhook.sh
+```
 
 ## TRMNL BYOS Device Setup
 
@@ -229,10 +319,13 @@ RUSTC_WRAPPER= cargo nextest run
 
 ## Endpoints
 
-- `GET /webhooks/whatsapp`: verifies Meta's `hub.verify_token` and returns
-  `hub.challenge` on a match.
-- `POST /webhooks/whatsapp`: parses inbound WhatsApp text messages, toggles the
-  matching list entry, and replies through the Meta Graph API.
+- WhatsApp mode: `GET /webhooks/whatsapp` verifies Meta's `hub.verify_token`
+  against `WEBHOOK_KEY` and returns `hub.challenge` on a match.
+- WhatsApp mode: `POST /webhooks/whatsapp` parses inbound WhatsApp text messages,
+  toggles the matching list entry, and replies through the Meta Graph API.
+- Telegram mode: `POST /webhooks/telegram` requires
+  `X-Telegram-Bot-Api-Secret-Token: WEBHOOK_KEY`, parses inbound `message.text`
+  updates, toggles the matching list entry, and replies through `sendMessage`.
 - `GET /api/setup`: accepts a TRMNL firmware `ID` header and returns setup JSON
   including `api_key`, `friendly_id`, `image_url`, and `filename`.
 - `GET /api/display`: requires TRMNL firmware `ID` and `Access-Token` headers

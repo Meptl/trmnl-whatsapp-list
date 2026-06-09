@@ -7,22 +7,42 @@ use axum::{Json, Router};
 use image::ImageEncoder;
 use serde::{Deserialize, Serialize};
 
-use crate::app::AppState;
-use crate::commands::{CommandExecutionError, execute_command, parse_command};
+use crate::app::{AppState, MessagingClient};
+use crate::commands::CommandExecutionError;
+use crate::config::MessagingProviderConfig;
+use crate::messaging::process_inbound_text_messages;
 use crate::store::{Entry, StoreHandle};
-use crate::whatsapp::{WhatsAppPayloadError, WhatsAppReplyError, parse_inbound_text_messages};
+use crate::telegram::{
+    TelegramPayloadError, TelegramReplyError,
+    parse_inbound_text_messages as parse_telegram_messages,
+};
+use crate::whatsapp::{
+    WhatsAppPayloadError, WhatsAppReplyError,
+    parse_inbound_text_messages as parse_whatsapp_messages,
+};
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route(
-            "/webhooks/whatsapp",
-            get(whatsapp_verify).post(whatsapp_webhook),
-        )
+    let router = Router::new()
         .route("/api/setup", get(trmnl_setup))
         .route("/api/display", get(trmnl_display))
         .route("/trmnl/list.png", get(trmnl_image_route))
-        .route("/api/log", post(trmnl_log))
-        .with_state(state)
+        .route("/api/log", post(trmnl_log));
+
+    if matches!(
+        state.config.messaging_provider,
+        MessagingProviderConfig::WhatsApp(_)
+    ) {
+        router
+            .route(
+                "/webhooks/whatsapp",
+                get(whatsapp_verify).post(whatsapp_webhook),
+            )
+            .with_state(state)
+    } else {
+        router
+            .route("/webhooks/telegram", post(telegram_webhook))
+            .with_state(state)
+    }
 }
 
 #[derive(Deserialize)]
@@ -188,7 +208,7 @@ async fn whatsapp_verify(
 
     match (query.verify_token, query.challenge) {
         (Some(verify_token), Some(challenge))
-            if verify_token == state.config.whatsapp.verify_token.as_str() =>
+            if verify_token == state.config.webhook_key.as_str() =>
         {
             Ok(challenge)
         }
@@ -197,9 +217,13 @@ async fn whatsapp_verify(
 }
 
 async fn whatsapp_webhook(State(state): State<AppState>, body: String) -> StatusCode {
+    let MessagingClient::WhatsApp(client) = state.messaging_client.clone() else {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    };
+
     whatsapp_webhook_status(
         process_whatsapp_webhook(&state.store, &body, |sender, reply| {
-            let client = state.whatsapp_client.clone();
+            let client = client.clone();
             async move { client.send_text_reply(&sender, &reply).await }
         })
         .await,
@@ -228,6 +252,62 @@ fn whatsapp_webhook_status(result: Result<(), WhatsAppWebhookError>) -> StatusCo
         }
         Err(WhatsAppWebhookError::Command(error)) => {
             eprintln!("Failed to update list from WhatsApp webhook: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn telegram_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> StatusCode {
+    match optional_header(&headers, "x-telegram-bot-api-secret-token") {
+        Some(secret) if secret == state.config.webhook_key.as_str() => {}
+        _ => return StatusCode::FORBIDDEN,
+    }
+
+    let MessagingClient::Telegram(client) = state.messaging_client.clone() else {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    };
+
+    telegram_webhook_status(
+        process_telegram_webhook(&state.store, &body, |chat_id, reply| {
+            let client = client.clone();
+            async move { client.send_text_reply(&chat_id, &reply).await }
+        })
+        .await,
+    )
+}
+
+#[cfg(test)]
+async fn telegram_webhook_with_reply_sender<SendReply, SendReplyFuture>(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+    send_reply: SendReply,
+) -> StatusCode
+where
+    SendReply: FnMut(String, String) -> SendReplyFuture,
+    SendReplyFuture: Future<Output = Result<(), TelegramReplyError>>,
+{
+    match optional_header(&headers, "x-telegram-bot-api-secret-token") {
+        Some(secret) if secret == state.config.webhook_key.as_str() => {}
+        _ => return StatusCode::FORBIDDEN,
+    }
+
+    telegram_webhook_status(process_telegram_webhook(&state.store, &body, send_reply).await)
+}
+
+fn telegram_webhook_status(result: Result<(), TelegramWebhookError>) -> StatusCode {
+    match result {
+        Ok(()) => StatusCode::OK,
+        Err(TelegramWebhookError::Payload(error)) => {
+            eprintln!("Invalid Telegram webhook payload: {error}");
+            StatusCode::BAD_REQUEST
+        }
+        Err(TelegramWebhookError::Command(error)) => {
+            eprintln!("Failed to update list from Telegram webhook: {error}");
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
@@ -464,7 +544,7 @@ fn log_trmnl_success(route: &str, headers: &TrmnlFirmwareHeaders, status: Status
 }
 
 fn acknowledge_state_shape(state: &AppState) {
-    let _ = (&state.config, &state.store, &state.whatsapp_client);
+    let _ = (&state.config, &state.store, &state.messaging_client);
 }
 
 const TRMNL_IMAGE_WIDTH: u32 = 800;
@@ -822,22 +902,20 @@ fn glyph_bits(character: char) -> u16 {
 async fn process_whatsapp_webhook<SendReply, SendReplyFuture>(
     store: &StoreHandle,
     body: &str,
-    mut send_reply: SendReply,
+    send_reply: SendReply,
 ) -> Result<(), WhatsAppWebhookError>
 where
     SendReply: FnMut(String, String) -> SendReplyFuture,
     SendReplyFuture: Future<Output = Result<(), WhatsAppReplyError>>,
 {
-    for message in parse_inbound_text_messages(body)? {
-        let command = parse_command(message.text());
-        let reply = execute_command(store, command)?;
-        println!("{reply}");
-        if let Err(error) = send_reply(message.sender().to_owned(), reply).await {
-            eprintln!("Failed to send WhatsApp reply: {error}");
-        }
-    }
-
-    Ok(())
+    process_inbound_text_messages(
+        store,
+        "WhatsApp",
+        parse_whatsapp_messages(body)?,
+        send_reply,
+    )
+    .await
+    .map_err(WhatsAppWebhookError::Command)
 }
 
 #[derive(Debug)]
@@ -858,6 +936,43 @@ impl From<CommandExecutionError> for WhatsAppWebhookError {
     }
 }
 
+async fn process_telegram_webhook<SendReply, SendReplyFuture>(
+    store: &StoreHandle,
+    body: &str,
+    send_reply: SendReply,
+) -> Result<(), TelegramWebhookError>
+where
+    SendReply: FnMut(String, String) -> SendReplyFuture,
+    SendReplyFuture: Future<Output = Result<(), TelegramReplyError>>,
+{
+    process_inbound_text_messages(
+        store,
+        "Telegram",
+        parse_telegram_messages(body)?,
+        send_reply,
+    )
+    .await
+    .map_err(TelegramWebhookError::Command)
+}
+
+#[derive(Debug)]
+enum TelegramWebhookError {
+    Payload(TelegramPayloadError),
+    Command(CommandExecutionError),
+}
+
+impl From<TelegramPayloadError> for TelegramWebhookError {
+    fn from(error: TelegramPayloadError) -> Self {
+        Self::Payload(error)
+    }
+}
+
+impl From<CommandExecutionError> for TelegramWebhookError {
+    fn from(error: CommandExecutionError) -> Self {
+        Self::Command(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -867,7 +982,10 @@ mod tests {
     use axum::response::IntoResponse;
 
     use super::*;
-    use crate::config::{AppConfig, SecretString, TrmnlConfig, WhatsAppConfig};
+    use crate::config::{
+        AppConfig, MessagingProviderConfig, SecretString, TelegramConfig, TrmnlConfig,
+        WhatsAppConfig,
+    };
 
     #[test]
     fn builds_router_with_shared_state() {
@@ -1085,7 +1203,7 @@ mod tests {
             whatsapp_verify(
                 State(state),
                 Query(WhatsAppVerifyQuery {
-                    verify_token: Some("verify-secret".to_owned()),
+                    verify_token: Some("webhook-secret".to_owned()),
                     challenge: Some("challenge-body".to_owned()),
                 }),
             )
@@ -1147,7 +1265,7 @@ mod tests {
         );
         assert_eq!(response.api_key, "trmnl-secret");
         assert_firmware_safe_filename(&response.filename);
-        assert!(!serialized.contains("verify-secret"));
+        assert!(!serialized.contains("webhook-secret"));
         assert!(!serialized.contains("access-secret"));
     }
 
@@ -1732,6 +1850,124 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn telegram_webhook_requires_secret_header() {
+        let state = AppState::new_uninitialized(telegram_test_config());
+
+        assert_eq!(
+            telegram_webhook(
+                State(state.clone()),
+                HeaderMap::new(),
+                telegram_message_payload("1", "milk")
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            telegram_webhook(
+                State(state),
+                telegram_headers_with_secret("wrong-secret"),
+                telegram_message_payload("1", "milk"),
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_webhook_processes_text_message() {
+        let database = TestDatabase::new("telegram_webhook_processes_message");
+        let state = initialized_telegram_state(&database);
+        let mut sent_replies = Vec::new();
+
+        let status = telegram_webhook_with_reply_sender(
+            State(state.clone()),
+            telegram_headers_with_secret("webhook-secret"),
+            telegram_message_payload("-12345", "milk"),
+            |chat_id, reply| {
+                sent_replies.push((chat_id, reply));
+                async { Ok(()) }
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            sent_replies,
+            [("-12345".to_owned(), "\"milk\" added to list.".to_owned())]
+        );
+        let entries = state.store.list_entries().expect("entries should list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text(), "milk");
+    }
+
+    #[tokio::test]
+    async fn telegram_webhook_ignores_unsupported_updates() {
+        let database = TestDatabase::new("telegram_webhook_ignores_update");
+        let state = initialized_telegram_state(&database);
+        let mut sent_replies = Vec::new();
+
+        let status = telegram_webhook_with_reply_sender(
+            State(state.clone()),
+            telegram_headers_with_secret("webhook-secret"),
+            r#"{"update_id":1000,"edited_message":{"message_id":1,"text":"milk"}}"#.to_owned(),
+            |chat_id, reply| {
+                sent_replies.push((chat_id, reply));
+                async { Ok(()) }
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(sent_replies.is_empty());
+        assert!(
+            state
+                .store
+                .list_entries()
+                .expect("entries should list")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_webhook_rejects_invalid_json_without_secret_response_body() {
+        let state = AppState::new_uninitialized(telegram_test_config());
+
+        assert_eq!(
+            telegram_webhook(
+                State(state),
+                telegram_headers_with_secret("webhook-secret"),
+                "{".to_owned(),
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_webhook_acknowledges_processed_message_when_reply_fails() {
+        let database = TestDatabase::new("telegram_webhook_acknowledges_reply_failure");
+        let state = initialized_telegram_state(&database);
+        let mut reply_attempts = 0;
+
+        let status = telegram_webhook_with_reply_sender(
+            State(state.clone()),
+            telegram_headers_with_secret("webhook-secret"),
+            telegram_message_payload("1", "Cow"),
+            |_chat_id, _reply| {
+                reply_attempts += 1;
+                async { Err(request_build_telegram_reply_error()) }
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reply_attempts, 1);
+        let entries = state.store.list_entries().expect("entries should list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text(), "Cow");
+    }
+
     fn valid_trmnl_headers() -> HeaderMap {
         trmnl_headers_with_access_token("trmnl-secret")
     }
@@ -1892,13 +2128,41 @@ mod tests {
         headers
     }
 
+    fn telegram_headers_with_secret(secret: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-telegram-bot-api-secret-token",
+            HeaderValue::from_str(secret).expect("test Telegram secret should be valid"),
+        );
+        headers
+    }
+
     fn test_config() -> AppConfig {
+        whatsapp_test_config()
+    }
+
+    fn whatsapp_test_config() -> AppConfig {
         AppConfig {
-            whatsapp: WhatsAppConfig {
-                verify_token: SecretString::from_test_value("verify-secret"),
+            webhook_key: SecretString::from_test_value("webhook-secret"),
+            messaging_provider: MessagingProviderConfig::WhatsApp(WhatsAppConfig {
                 access_token: SecretString::from_test_value("access-secret"),
                 phone_number_id: "phone-number".to_owned(),
+            }),
+            trmnl: TrmnlConfig {
+                token: SecretString::from_test_value("trmnl-secret"),
             },
+            public_base_url: "https://example.test".to_owned(),
+            database_path: PathBuf::from("list.db"),
+            bind_addr: "127.0.0.1:3000".to_owned(),
+        }
+    }
+
+    fn telegram_test_config() -> AppConfig {
+        AppConfig {
+            webhook_key: SecretString::from_test_value("webhook-secret"),
+            messaging_provider: MessagingProviderConfig::Telegram(TelegramConfig {
+                bot_token: SecretString::from_test_value("bot-secret"),
+            }),
             trmnl: TrmnlConfig {
                 token: SecretString::from_test_value("trmnl-secret"),
             },
@@ -1910,6 +2174,13 @@ mod tests {
 
     fn initialized_state(database: &TestDatabase) -> AppState {
         let mut config = test_config();
+        config.database_path = database.path().to_path_buf();
+
+        AppState::new(config).expect("app state should initialize")
+    }
+
+    fn initialized_telegram_state(database: &TestDatabase) -> AppState {
+        let mut config = telegram_test_config();
         config.database_path = database.path().to_path_buf();
 
         AppState::new(config).expect("app state should initialize")
@@ -1990,6 +2261,28 @@ mod tests {
             .expect_err("invalid URL should fail request construction");
 
         WhatsAppReplyError::RequestBuild(error)
+    }
+
+    fn request_build_telegram_reply_error() -> TelegramReplyError {
+        let error = reqwest::Client::new()
+            .get("http://")
+            .build()
+            .expect_err("invalid URL should fail request construction");
+
+        TelegramReplyError::RequestBuild(error)
+    }
+
+    fn telegram_message_payload(chat_id: &str, text: &str) -> String {
+        format!(
+            r#"{{
+                "update_id": 1000,
+                "message": {{
+                    "message_id": 42,
+                    "chat": {{ "id": {chat_id}, "type": "private" }},
+                    "text": "{text}"
+                }}
+            }}"#
+        )
     }
 
     fn status_and_non_text_payload() -> &'static str {

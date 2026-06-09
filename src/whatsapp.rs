@@ -4,38 +4,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{SecretString, WhatsAppConfig};
+use crate::messaging::InboundTextMessage;
 
 const GRAPH_API_VERSION: &str = "v23.0";
 const GRAPH_API_BASE_URL: &str = "https://graph.facebook.com";
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InboundTextMessage {
-    sender: String,
-    message_id: String,
-    text: String,
-}
-
-impl InboundTextMessage {
-    fn new(sender: String, message_id: String, text: String) -> Self {
-        Self {
-            sender,
-            message_id,
-            text,
-        }
-    }
-
-    pub fn sender(&self) -> &str {
-        &self.sender
-    }
-
-    pub fn message_id(&self) -> &str {
-        &self.message_id
-    }
-
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-}
 
 pub fn parse_inbound_text_messages(
     payload: &str,
@@ -355,16 +327,16 @@ mod tests {
             parse_inbound_text_messages(payload).expect("valid webhook payload should parse");
 
         assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].sender(), "15550000001");
+        assert_eq!(messages[0].reply_target(), "15550000001");
         assert_eq!(messages[0].message_id(), "wamid.first");
         assert_eq!(messages[0].text(), "milk");
-        assert_eq!(messages[1].sender(), "15550000002");
+        assert_eq!(messages[1].reply_target(), "15550000002");
         assert_eq!(messages[1].message_id(), "wamid.second");
         assert_eq!(messages[1].text(), "eggs");
-        assert_eq!(messages[2].sender(), "15550000003");
+        assert_eq!(messages[2].reply_target(), "15550000003");
         assert_eq!(messages[2].message_id(), "wamid.third");
         assert_eq!(messages[2].text(), "bread");
-        assert_eq!(messages[3].sender(), "15550000004");
+        assert_eq!(messages[3].reply_target(), "15550000004");
         assert_eq!(messages[3].message_id(), "wamid.fourth");
         assert_eq!(messages[3].text(), "coffee");
     }
@@ -526,7 +498,6 @@ mod tests {
 
     fn test_whatsapp_config() -> WhatsAppConfig {
         WhatsAppConfig {
-            verify_token: SecretString::from_test_value("verify-secret"),
             access_token: SecretString::from_test_value("access-secret"),
             phone_number_id: "phone-number".to_owned(),
         }

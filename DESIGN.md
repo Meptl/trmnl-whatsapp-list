@@ -6,7 +6,7 @@ The service owns one shared text list. It does not model users, per-chat lists,
 grocery-specific concepts, permissions beyond shared endpoint tokens, or
 cross-provider transport abstractions.
 
-Non-empty WhatsApp text is treated as a list entry toggle by default. If the
+Non-empty active-provider text is treated as a list entry toggle by default. If the
 trimmed text is not present, it is added. If it is already present, it is
 removed. Matching uses exact text first, then case-insensitive text if no exact
 match exists.
@@ -31,22 +31,45 @@ User-facing numeric positions are 1-based indexes into that ordered list.
 
 ## Boundaries
 
-Message interpretation and execution are independent of WhatsApp payloads and
+Message interpretation and execution are independent of provider payloads and
 HTTP handlers. Execution depends on the store boundary and returns reply text
 that a transport can send.
 
 Persistence owns exact storage and deterministic list mutations. Text trimming
 and message interpretation belong outside the store.
 
-WhatsApp payload parsing owns Meta webhook JSON shape only. It extracts inbound
-text messages and ignores unsupported non-text or status-only payloads.
+Provider payload parsing owns provider webhook JSON shapes only. WhatsApp parsing
+extracts inbound text messages and ignores unsupported non-text or status-only
+payloads. Telegram parsing extracts normal `message.text` updates and ignores
+edited messages, channel posts, non-text updates, incomplete updates, and
+unsupported top-level shapes.
 
-The reply client owns Meta Graph API request construction and sending. The app
-does not provide a provider fallback or an alternate WhatsApp transport.
+Provider reply clients own request construction and sending. WhatsApp uses the
+Meta Graph API. Telegram uses the official Bot API `sendMessage` endpoint. The
+app runs exactly one configured provider and does not provide fallback transports.
 
 HTTP handlers own route-level behavior and should compose configuration, store,
 message execution, payload parsing, and transport clients without moving domain
 rules into Axum-specific code.
+
+
+## Messaging Providers
+
+The service runs in one active provider mode per deployment. Provider mode is
+inferred from environment variables:
+
+- Telegram mode: `WEBHOOK_KEY` and `TELEGRAM_BOT_TOKEN`.
+- WhatsApp mode: `WEBHOOK_KEY`, `WHATSAPP_ACCESS_TOKEN`, and
+  `WHATSAPP_PHONE_NUMBER_ID`.
+
+Telegram mode is preferred when both provider groups are present. Startup fails
+if neither provider group is present or if Telegram is absent and the WhatsApp
+group is incomplete. `WHATSAPP_VERIFY_TOKEN` is intentionally not a
+compatibility alias; use `WEBHOOK_KEY`.
+
+WhatsApp exposes `GET/POST /webhooks/whatsapp`. Telegram exposes
+`POST /webhooks/telegram` and requires `X-Telegram-Bot-Api-Secret-Token` to
+match `WEBHOOK_KEY`. Only the active provider route is registered.
 
 ## TRMNL BYOS
 
@@ -86,6 +109,7 @@ header to match the server-side `TRMNL_TOKEN`.
 ## Compatibility
 
 Do not add fallback methods, provider compatibility layers, legacy aliases, or
-backward-compatibility paths unless the user explicitly requests them. Prefer
-replacing incomplete approaches with the intended implementation over
-supporting both old and new behavior.
+backward-compatibility paths unless the user explicitly requests them. Exactly
+one messaging provider is active per deployment, with Telegram preferred when
+both provider credential groups exist. Prefer replacing incomplete approaches
+with the intended implementation over supporting both old and new behavior.

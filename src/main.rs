@@ -5,7 +5,10 @@ mod app;
 mod commands;
 mod config;
 mod http;
+mod messaging;
 mod store;
+#[allow(dead_code)]
+mod telegram;
 #[allow(dead_code)]
 mod whatsapp;
 
@@ -20,15 +23,24 @@ async fn main() -> Result<(), StartupError> {
 async fn run() -> Result<(), StartupError> {
     let config = config::AppConfig::from_env()?;
     let bind_addr = config.bind_addr.clone();
+    let webhook_mode = webhook_mode_message(&config.messaging_provider);
     let router = build_router_from_config(config)?;
     let listener = TcpListener::bind(&bind_addr).await?;
     let local_addr = listener.local_addr()?;
 
+    println!("Webhook mode: {webhook_mode}");
     println!("Listening on http://{local_addr}");
 
     axum::serve(listener, router).await?;
 
     Ok(())
+}
+
+fn webhook_mode_message(provider: &config::MessagingProviderConfig) -> &'static str {
+    match provider {
+        config::MessagingProviderConfig::WhatsApp(_) => "WhatsApp (/webhooks/whatsapp)",
+        config::MessagingProviderConfig::Telegram(_) => "Telegram (/webhooks/telegram)",
+    }
 }
 
 fn build_router_from_config(config: config::AppConfig) -> Result<Router, StartupError> {
@@ -88,13 +100,41 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::config::{AppConfig, SecretString, TrmnlConfig, WhatsAppConfig};
+    use crate::config::{
+        AppConfig, MessagingProviderConfig, SecretString, TelegramConfig, TrmnlConfig,
+        WhatsAppConfig,
+    };
 
     use super::*;
 
     #[test]
     fn executable_package_metadata_is_declared() {
         assert_eq!(env!("CARGO_PKG_NAME"), "trmnl-whatsapp-list");
+    }
+
+    #[test]
+    fn webhook_mode_message_names_whatsapp_route() {
+        let provider = MessagingProviderConfig::WhatsApp(WhatsAppConfig {
+            access_token: SecretString::from_test_value("access-secret"),
+            phone_number_id: "phone-number".to_owned(),
+        });
+
+        assert_eq!(
+            webhook_mode_message(&provider),
+            "WhatsApp (/webhooks/whatsapp)"
+        );
+    }
+
+    #[test]
+    fn webhook_mode_message_names_telegram_route() {
+        let provider = MessagingProviderConfig::Telegram(TelegramConfig {
+            bot_token: SecretString::from_test_value("bot-secret"),
+        });
+
+        assert_eq!(
+            webhook_mode_message(&provider),
+            "Telegram (/webhooks/telegram)"
+        );
     }
 
     #[test]
@@ -125,11 +165,11 @@ mod tests {
 
     fn test_config(database_path: PathBuf) -> AppConfig {
         AppConfig {
-            whatsapp: WhatsAppConfig {
-                verify_token: SecretString::from_test_value("verify-secret"),
+            webhook_key: SecretString::from_test_value("webhook-secret"),
+            messaging_provider: MessagingProviderConfig::WhatsApp(WhatsAppConfig {
                 access_token: SecretString::from_test_value("access-secret"),
                 phone_number_id: "phone-number".to_owned(),
-            },
+            }),
             trmnl: TrmnlConfig {
                 token: SecretString::from_test_value("trmnl-secret"),
             },
