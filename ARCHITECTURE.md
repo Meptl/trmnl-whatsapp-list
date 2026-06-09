@@ -17,7 +17,7 @@ The implemented foundation currently includes:
 - Crate-level `#![forbid(unsafe_code)]`.
 - Runtime configuration loaded from environment variables, including
   WhatsApp-or-Telegram provider selection with Telegram preferred when both are
-  configured.
+  configured and optional `CHAT_AUTH_KEY` chat login configuration.
 - Secret wrapper debug output that redacts token values.
 - Axum startup that loads configuration, initializes application state, binds
   `BIND_ADDR`, and serves requests.
@@ -58,6 +58,8 @@ Required Telegram mode variables:
 
 Optional environment variables:
 
+- `CHAT_AUTH_KEY`, preshared chat login key. If omitted, chat auth remains
+  enforced and no sender can log in.
 - `DATABASE_PATH`, defaulting to `list.db`
 - `BIND_ADDR`, defaulting to `127.0.0.1:3000`
 
@@ -90,8 +92,8 @@ The service is split into these responsibilities:
   provider reply client.
 - Persistence uses `rusqlite` directly against `DATABASE_PATH` and initializes
   the schema with `CREATE TABLE IF NOT EXISTS`.
-- Message interpretation and execution stay independent of provider payload
-  shapes, provider transports, and HTTP handlers.
+- Message interpretation, chat auth gating, and execution stay independent of
+  provider payload shapes, provider transports, and HTTP handlers.
 - WhatsApp integration targets the official Meta WhatsApp Cloud API only.
 - Telegram integration targets the official Telegram Bot API only.
 - Only the active provider webhook route is registered; when both provider credential groups are configured, Telegram is active.
@@ -99,11 +101,17 @@ The service is split into these responsibilities:
 
 ## Data Model
 
-SQLite persistence owns one table named `entries` with:
+SQLite persistence owns one list table named `entries` with:
 
 - `id`
 - `text`
 - `created_at`
+
+SQLite persistence also owns one chat auth table named
+`authorized_chat_senders` with:
+
+- `provider`
+- `sender_id`
 
 Listing order is creation order. Displayed numeric positions are 1-based and map
 directly to that creation-ordered list.
@@ -116,6 +124,7 @@ The store operations are:
 - remove by exact text, then case-insensitive text if no exact match exists
 - remove by displayed numeric position
 - clear all entries
+- check, add, and remove authorized chat senders by provider and sender id
 
 Text is stored exactly as supplied to the store; message execution owns trimming
 and validation.
@@ -143,10 +152,12 @@ requires `X-Telegram-Bot-Api-Secret-Token` to match `WEBHOOK_KEY`.
 Handler behavior:
 
 - `GET /webhooks/whatsapp` verifies Meta's challenge.
-- `POST /webhooks/whatsapp` parses inbound text messages, toggles matching list
-  entries, logs reply text, and sends replies.
-- `POST /webhooks/telegram` parses normal `message.text` updates, toggles
-  matching list entries, logs reply text, and sends replies.
+- `POST /webhooks/whatsapp` parses inbound text messages, authorizes senders via
+  `/login <CHAT_AUTH_KEY>`, gates list access by sender auth state, logs reply
+  text, and sends replies.
+- `POST /webhooks/telegram` parses normal `message.text` updates, authorizes
+  senders via `/login <CHAT_AUTH_KEY>`, gates list access by sender auth state,
+  logs reply text, and sends replies.
 - `GET /api/setup` returns TRMNL setup JSON with `api_key`, `friendly_id`,
   `image_url`, and `filename`.
 - `GET /api/display` returns TRMNL display JSON containing the list PNG URL.
@@ -175,9 +186,10 @@ payloads, incomplete text messages, and unsupported top-level shapes do not
 produce list changes.
 
 Telegram payload parsing accepts Bot API Update JSON and extracts normal
-`message.text` updates with chat id, message id, and text. Edited messages,
-channel posts, non-text messages, incomplete messages, and unsupported top-level
-shapes do not produce list changes.
+`message.text` updates with chat id, sender user id, message id, and text. The
+sender user id is the auth identity; the chat id remains the reply target.
+Edited messages, channel posts, non-text messages, incomplete messages, and
+unsupported top-level shapes do not produce list changes.
 
 The reply client targets:
 
@@ -197,7 +209,14 @@ omits the bot token.
 
 ## Message Behavior
 
-Non-empty inbound text from either provider toggles the matching list entry:
+Inbound text from either provider is ignored until that provider sender id is
+authorized. `/login <CHAT_AUTH_KEY>` authorizes a sender, `/logout` removes that
+sender's authorization, and wrong or malformed login attempts are silent. If
+`CHAT_AUTH_KEY` is omitted, no sender can log in until the variable is set and
+the service restarts.
+
+Non-empty authorized inbound text from either provider toggles the matching list
+entry:
 
 - if the trimmed text is absent, add it and reply `"text" added to list.`
 - if the trimmed text is present, remove it and reply `"text" removed from list.`
@@ -207,6 +226,8 @@ exists.
 
 Supported slash commands are:
 
+- `/login <CHAT_AUTH_KEY>`: authorize the provider sender id
+- `/logout`: remove authorization for the provider sender id
 - `/list`: return entries in display order
 - `/clear`: remove all entries
 

@@ -166,6 +166,7 @@ mod tests {
     fn test_config(database_path: PathBuf) -> AppConfig {
         AppConfig {
             webhook_key: SecretString::from_test_value("webhook-secret"),
+            chat_auth_key: Some(SecretString::from_test_value("chat-secret")),
             messaging_provider: MessagingProviderConfig::WhatsApp(WhatsAppConfig {
                 access_token: SecretString::from_test_value("access-secret"),
                 phone_number_id: "phone-number".to_owned(),

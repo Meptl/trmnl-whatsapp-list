@@ -222,10 +222,15 @@ async fn whatsapp_webhook(State(state): State<AppState>, body: String) -> Status
     };
 
     whatsapp_webhook_status(
-        process_whatsapp_webhook(&state.store, &body, |sender, reply| {
-            let client = client.clone();
-            async move { client.send_text_reply(&sender, &reply).await }
-        })
+        process_whatsapp_webhook(
+            &state.store,
+            state.config.chat_auth_key.as_ref(),
+            &body,
+            |sender, reply| {
+                let client = client.clone();
+                async move { client.send_text_reply(&sender, &reply).await }
+            },
+        )
         .await,
     )
 }
@@ -240,7 +245,15 @@ where
     SendReply: FnMut(String, String) -> SendReplyFuture,
     SendReplyFuture: Future<Output = Result<(), WhatsAppReplyError>>,
 {
-    whatsapp_webhook_status(process_whatsapp_webhook(&state.store, &body, send_reply).await)
+    whatsapp_webhook_status(
+        process_whatsapp_webhook(
+            &state.store,
+            state.config.chat_auth_key.as_ref(),
+            &body,
+            send_reply,
+        )
+        .await,
+    )
 }
 
 fn whatsapp_webhook_status(result: Result<(), WhatsAppWebhookError>) -> StatusCode {
@@ -272,10 +285,15 @@ async fn telegram_webhook(
     };
 
     telegram_webhook_status(
-        process_telegram_webhook(&state.store, &body, |chat_id, reply| {
-            let client = client.clone();
-            async move { client.send_text_reply(&chat_id, &reply).await }
-        })
+        process_telegram_webhook(
+            &state.store,
+            state.config.chat_auth_key.as_ref(),
+            &body,
+            |chat_id, reply| {
+                let client = client.clone();
+                async move { client.send_text_reply(&chat_id, &reply).await }
+            },
+        )
         .await,
     )
 }
@@ -296,7 +314,15 @@ where
         _ => return StatusCode::FORBIDDEN,
     }
 
-    telegram_webhook_status(process_telegram_webhook(&state.store, &body, send_reply).await)
+    telegram_webhook_status(
+        process_telegram_webhook(
+            &state.store,
+            state.config.chat_auth_key.as_ref(),
+            &body,
+            send_reply,
+        )
+        .await,
+    )
 }
 
 fn telegram_webhook_status(result: Result<(), TelegramWebhookError>) -> StatusCode {
@@ -901,6 +927,7 @@ fn glyph_bits(character: char) -> u16 {
 
 async fn process_whatsapp_webhook<SendReply, SendReplyFuture>(
     store: &StoreHandle,
+    chat_auth_key: Option<&crate::config::SecretString>,
     body: &str,
     send_reply: SendReply,
 ) -> Result<(), WhatsAppWebhookError>
@@ -910,6 +937,7 @@ where
 {
     process_inbound_text_messages(
         store,
+        chat_auth_key,
         "WhatsApp",
         parse_whatsapp_messages(body)?,
         send_reply,
@@ -938,6 +966,7 @@ impl From<CommandExecutionError> for WhatsAppWebhookError {
 
 async fn process_telegram_webhook<SendReply, SendReplyFuture>(
     store: &StoreHandle,
+    chat_auth_key: Option<&crate::config::SecretString>,
     body: &str,
     send_reply: SendReply,
 ) -> Result<(), TelegramWebhookError>
@@ -947,6 +976,7 @@ where
 {
     process_inbound_text_messages(
         store,
+        chat_auth_key,
         "Telegram",
         parse_telegram_messages(body)?,
         send_reply,
@@ -1752,6 +1782,14 @@ mod tests {
     async fn whatsapp_webhook_processes_text_messages_in_payload_order() {
         let database = TestDatabase::new("webhook_processes_messages");
         let state = initialized_state(&database);
+        state
+            .store
+            .authorize_chat_sender("whatsapp", "15550000001")
+            .expect("first sender should authorize");
+        state
+            .store
+            .authorize_chat_sender("whatsapp", "15550000002")
+            .expect("second sender should authorize");
         let mut sent_replies = Vec::new();
 
         let status = whatsapp_webhook_with_reply_sender(
@@ -1794,6 +1832,10 @@ mod tests {
     async fn whatsapp_webhook_acknowledges_processed_message_when_reply_fails() {
         let database = TestDatabase::new("webhook_acknowledges_reply_failure");
         let state = initialized_state(&database);
+        state
+            .store
+            .authorize_chat_sender("whatsapp", "15550000001")
+            .expect("sender should authorize");
         let mut reply_attempts = 0;
 
         let status = whatsapp_webhook_with_reply_sender(
@@ -1822,6 +1864,69 @@ mod tests {
         let status = whatsapp_webhook_with_reply_sender(
             State(state.clone()),
             status_and_non_text_payload().to_owned(),
+            |sender, reply| {
+                sent_replies.push((sender, reply));
+                async { Ok(()) }
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(sent_replies.is_empty());
+        assert!(
+            state
+                .store
+                .list_entries()
+                .expect("entries should list")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn whatsapp_webhook_requires_login_before_mutating_list() {
+        let database = TestDatabase::new("whatsapp_webhook_chat_auth");
+        let state = initialized_state(&database);
+        let mut sent_replies = Vec::new();
+
+        let status = whatsapp_webhook_with_reply_sender(
+            State(state.clone()),
+            whatsapp_auth_flow_payload().to_owned(),
+            |sender, reply| {
+                sent_replies.push((sender, reply));
+                async { Ok(()) }
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            sent_replies,
+            [
+                ("15550000001".to_owned(), "Logged in.".to_owned()),
+                (
+                    "15550000001".to_owned(),
+                    "\"milk\" added to list.".to_owned()
+                ),
+                ("15550000001".to_owned(), "Logged out.".to_owned()),
+            ]
+        );
+        let entries = state.store.list_entries().expect("entries should list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text(), "milk");
+    }
+
+    #[tokio::test]
+    async fn whatsapp_webhook_is_locked_when_chat_auth_key_is_missing() {
+        let database = TestDatabase::new("whatsapp_webhook_missing_chat_auth_key");
+        let mut config = whatsapp_test_config();
+        config.chat_auth_key = None;
+        config.database_path = database.path().to_path_buf();
+        let state = AppState::new(config).expect("app state should initialize");
+        let mut sent_replies = Vec::new();
+
+        let status = whatsapp_webhook_with_reply_sender(
+            State(state.clone()),
+            single_message_payload("15550000001", "/login chat-secret"),
             |sender, reply| {
                 sent_replies.push((sender, reply));
                 async { Ok(()) }
@@ -1878,6 +1983,10 @@ mod tests {
     async fn telegram_webhook_processes_text_message() {
         let database = TestDatabase::new("telegram_webhook_processes_message");
         let state = initialized_telegram_state(&database);
+        state
+            .store
+            .authorize_chat_sender("telegram", "999")
+            .expect("sender should authorize");
         let mut sent_replies = Vec::new();
 
         let status = telegram_webhook_with_reply_sender(
@@ -1948,6 +2057,10 @@ mod tests {
     async fn telegram_webhook_acknowledges_processed_message_when_reply_fails() {
         let database = TestDatabase::new("telegram_webhook_acknowledges_reply_failure");
         let state = initialized_telegram_state(&database);
+        state
+            .store
+            .authorize_chat_sender("telegram", "999")
+            .expect("sender should authorize");
         let mut reply_attempts = 0;
 
         let status = telegram_webhook_with_reply_sender(
@@ -2144,6 +2257,7 @@ mod tests {
     fn whatsapp_test_config() -> AppConfig {
         AppConfig {
             webhook_key: SecretString::from_test_value("webhook-secret"),
+            chat_auth_key: Some(SecretString::from_test_value("chat-secret")),
             messaging_provider: MessagingProviderConfig::WhatsApp(WhatsAppConfig {
                 access_token: SecretString::from_test_value("access-secret"),
                 phone_number_id: "phone-number".to_owned(),
@@ -2160,6 +2274,7 @@ mod tests {
     fn telegram_test_config() -> AppConfig {
         AppConfig {
             webhook_key: SecretString::from_test_value("webhook-secret"),
+            chat_auth_key: Some(SecretString::from_test_value("chat-secret")),
             messaging_provider: MessagingProviderConfig::Telegram(TelegramConfig {
                 bot_token: SecretString::from_test_value("bot-secret"),
             }),
@@ -2227,6 +2342,47 @@ mod tests {
         }"#
     }
 
+    fn whatsapp_auth_flow_payload() -> &'static str {
+        r#"{
+            "entry": [
+                {
+                    "changes": [
+                        {
+                            "value": {
+                                "messages": [
+                                    {
+                                        "from": "15550000001",
+                                        "id": "wamid.login",
+                                        "type": "text",
+                                        "text": { "body": "/login chat-secret" }
+                                    },
+                                    {
+                                        "from": "15550000001",
+                                        "id": "wamid.milk",
+                                        "type": "text",
+                                        "text": { "body": "milk" }
+                                    },
+                                    {
+                                        "from": "15550000001",
+                                        "id": "wamid.logout",
+                                        "type": "text",
+                                        "text": { "body": "/logout" }
+                                    },
+                                    {
+                                        "from": "15550000001",
+                                        "id": "wamid.eggs",
+                                        "type": "text",
+                                        "text": { "body": "eggs" }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ]
+        }"#
+    }
+
     fn single_message_payload(sender: &str, text: &str) -> String {
         format!(
             r#"{{
@@ -2278,6 +2434,7 @@ mod tests {
                 "update_id": 1000,
                 "message": {{
                     "message_id": 42,
+                    "from": {{ "id": 999, "is_bot": false, "first_name": "User" }},
                     "chat": {{ "id": {chat_id}, "type": "private" }},
                     "text": "{text}"
                 }}

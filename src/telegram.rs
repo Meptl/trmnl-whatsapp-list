@@ -4,7 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{SecretString, TelegramConfig};
-use crate::messaging::InboundTextMessage;
+use crate::messaging::{ChatAuthIdentity, InboundTextMessage};
 
 const TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
 
@@ -164,6 +164,7 @@ impl TelegramUpdate {
 #[derive(Deserialize)]
 struct TelegramMessage {
     message_id: Option<i64>,
+    from: Option<TelegramUser>,
     chat: Option<TelegramChat>,
     text: Option<String>,
 }
@@ -172,6 +173,7 @@ impl TelegramMessage {
     fn into_inbound_text_message(self) -> Option<InboundTextMessage> {
         Some(InboundTextMessage::new(
             self.chat?.id?.to_string(),
+            ChatAuthIdentity::new("telegram", self.from?.id?.to_string()),
             self.message_id?.to_string(),
             self.text?,
         ))
@@ -180,6 +182,11 @@ impl TelegramMessage {
 
 #[derive(Deserialize)]
 struct TelegramChat {
+    id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct TelegramUser {
     id: Option<i64>,
 }
 
@@ -206,6 +213,7 @@ mod tests {
             "update_id": 1000,
             "message": {
                 "message_id": 42,
+                "from": { "id": 67890, "is_bot": false, "first_name": "User" },
                 "chat": { "id": -12345, "type": "group" },
                 "text": "milk"
             }
@@ -215,6 +223,8 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].reply_target(), "-12345");
+        assert_eq!(messages[0].auth_identity().provider(), "telegram");
+        assert_eq!(messages[0].auth_identity().sender_id(), "67890");
         assert_eq!(messages[0].message_id(), "42");
         assert_eq!(messages[0].text(), "milk");
     }
@@ -224,8 +234,9 @@ mod tests {
         for payload in [
             r#"{"update_id":1000,"edited_message":{"message_id":1,"text":"milk"}}"#,
             r#"{"update_id":1000,"channel_post":{"message_id":1,"text":"milk"}}"#,
-            r#"{"update_id":1000,"message":{"message_id":1,"chat":{"id":1},"photo":[]}}"#,
-            r#"{"update_id":1000,"message":{"message_id":1,"text":"missing chat"}}"#,
+            r#"{"update_id":1000,"message":{"message_id":1,"from":{"id":2},"chat":{"id":1},"photo":[]}}"#,
+            r#"{"update_id":1000,"message":{"message_id":1,"from":{"id":2},"text":"missing chat"}}"#,
+            r#"{"update_id":1000,"message":{"message_id":1,"chat":{"id":1},"text":"missing from"}}"#,
             r#"[]"#,
         ] {
             let messages = parse_inbound_text_messages(payload).expect("payload should parse");

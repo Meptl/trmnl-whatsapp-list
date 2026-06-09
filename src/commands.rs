@@ -8,6 +8,8 @@ pub enum Command {
     ToggleEntry(String),
     ListEntries,
     ClearEntries,
+    Login(Option<String>),
+    Logout,
     Ignore,
 }
 
@@ -19,7 +21,9 @@ pub fn execute_command(
         Command::ToggleEntry(text) => toggle_entry(store, text),
         Command::ListEntries => list_entries(store),
         Command::ClearEntries => clear_entries(store),
-        Command::Ignore => Ok("Nothing to do. Send an item name to update the list.".to_owned()),
+        Command::Login(_) | Command::Logout | Command::Ignore => {
+            Ok("Nothing to do. Send an item name to update the list.".to_owned())
+        }
     }
 }
 
@@ -35,6 +39,21 @@ pub fn parse_command(message: &str) -> Command {
 
     if trimmed.eq_ignore_ascii_case("/clear") {
         return Command::ClearEntries;
+    }
+
+    if trimmed.eq_ignore_ascii_case("/logout") {
+        return Command::Logout;
+    }
+
+    let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+    if parts
+        .first()
+        .is_some_and(|command| command.eq_ignore_ascii_case("/login"))
+    {
+        return match parts.as_slice() {
+            [_, key] => Command::Login(Some((*key).to_owned())),
+            _ => Command::Login(None),
+        };
     }
 
     Command::ToggleEntry(trimmed.to_owned())
@@ -150,6 +169,13 @@ mod tests {
     fn slash_commands_are_case_insensitive() {
         assert_eq!(parse_command("/LIST"), Command::ListEntries);
         assert_eq!(parse_command(" /clear "), Command::ClearEntries);
+        assert_eq!(parse_command(" /logout "), Command::Logout);
+        assert_eq!(
+            parse_command(" /LOGIN secret "),
+            Command::Login(Some("secret".to_owned()))
+        );
+        assert_eq!(parse_command("/login"), Command::Login(None));
+        assert_eq!(parse_command("/login one two"), Command::Login(None));
     }
 
     #[test]

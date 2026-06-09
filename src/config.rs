@@ -8,6 +8,7 @@ pub const WEBHOOK_KEY: &str = "WEBHOOK_KEY";
 pub const WHATSAPP_ACCESS_TOKEN: &str = "WHATSAPP_ACCESS_TOKEN";
 pub const WHATSAPP_PHONE_NUMBER_ID: &str = "WHATSAPP_PHONE_NUMBER_ID";
 pub const TELEGRAM_BOT_TOKEN: &str = "TELEGRAM_BOT_TOKEN";
+pub const CHAT_AUTH_KEY: &str = "CHAT_AUTH_KEY";
 const TRMNL_TOKEN: &str = "TRMNL_TOKEN";
 const PUBLIC_BASE_URL: &str = "PUBLIC_BASE_URL";
 const DATABASE_PATH: &str = "DATABASE_PATH";
@@ -19,6 +20,7 @@ const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
 #[derive(Clone)]
 pub struct AppConfig {
     pub webhook_key: SecretString,
+    pub chat_auth_key: Option<SecretString>,
     pub messaging_provider: MessagingProviderConfig,
     pub trmnl: TrmnlConfig,
     pub public_base_url: String,
@@ -74,6 +76,7 @@ impl fmt::Debug for AppConfig {
         formatter
             .debug_struct("AppConfig")
             .field("webhook_key", &self.webhook_key)
+            .field("chat_auth_key", &self.chat_auth_key)
             .field("messaging_provider", &self.messaging_provider)
             .field("trmnl", &self.trmnl)
             .field("public_base_url", &self.public_base_url)
@@ -178,6 +181,7 @@ impl AppConfig {
 
         Ok(Self {
             webhook_key: SecretString(source.required(WEBHOOK_KEY)?),
+            chat_auth_key: source.optional(CHAT_AUTH_KEY)?.map(SecretString),
             messaging_provider: messaging_provider_from_source(&source)?,
             trmnl: TrmnlConfig {
                 token: SecretString(source.required(TRMNL_TOKEN)?),
@@ -287,6 +291,7 @@ mod tests {
             .expect("config should load");
 
         assert_eq!(config.webhook_key.as_str(), "webhook-secret");
+        assert_eq!(config.chat_auth_key, None);
         let MessagingProviderConfig::WhatsApp(whatsapp) = config.messaging_provider else {
             panic!("WhatsApp config should load");
         };
@@ -311,16 +316,19 @@ mod tests {
 
     #[test]
     fn optional_values_override_defaults() {
-        let config = AppConfig::from_pairs(
-            COMMON_ENV
-                .into_iter()
-                .chain(WHATSAPP_ENV)
-                .chain([(DATABASE_PATH, "/tmp/list.db"), (BIND_ADDR, "0.0.0.0:8080")]),
-        )
+        let config = AppConfig::from_pairs(COMMON_ENV.into_iter().chain(WHATSAPP_ENV).chain([
+            (DATABASE_PATH, "/tmp/list.db"),
+            (BIND_ADDR, "0.0.0.0:8080"),
+            (CHAT_AUTH_KEY, "chat-secret"),
+        ]))
         .expect("config should load");
 
         assert_eq!(config.database_path, PathBuf::from("/tmp/list.db"));
         assert_eq!(config.bind_addr, "0.0.0.0:8080");
+        assert_eq!(
+            config.chat_auth_key.as_ref().map(SecretString::as_str),
+            Some("chat-secret")
+        );
     }
 
     #[test]
@@ -412,6 +420,15 @@ mod tests {
         assert_eq!(format!("{:?}", config.webhook_key), "[redacted]");
         assert!(!format!("{config:?}").contains("webhook-secret"));
         assert!(!format!("{config:?}").contains("access-secret"));
+
+        let config = AppConfig::from_pairs(
+            COMMON_ENV
+                .into_iter()
+                .chain(WHATSAPP_ENV)
+                .chain([(CHAT_AUTH_KEY, "chat-secret")]),
+        )
+        .expect("config should load");
+        assert!(!format!("{config:?}").contains("chat-secret"));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{SecretString, WhatsAppConfig};
-use crate::messaging::InboundTextMessage;
+use crate::messaging::{ChatAuthIdentity, InboundTextMessage};
 
 const GRAPH_API_VERSION: &str = "v23.0";
 const GRAPH_API_BASE_URL: &str = "https://graph.facebook.com";
@@ -204,8 +204,11 @@ impl WhatsAppMessage {
             return None;
         }
 
+        let sender = self.from?;
+
         Some(InboundTextMessage::new(
-            self.from?,
+            sender.clone(),
+            ChatAuthIdentity::new("whatsapp", sender),
             self.id?,
             self.text?.body?,
         ))
@@ -328,6 +331,8 @@ mod tests {
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].reply_target(), "15550000001");
+        assert_eq!(messages[0].auth_identity().provider(), "whatsapp");
+        assert_eq!(messages[0].auth_identity().sender_id(), "15550000001");
         assert_eq!(messages[0].message_id(), "wamid.first");
         assert_eq!(messages[0].text(), "milk");
         assert_eq!(messages[1].reply_target(), "15550000002");

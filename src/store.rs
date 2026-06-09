@@ -11,6 +11,13 @@ const CREATE_ENTRIES_TABLE: &str = "\
         created_at TEXT NOT NULL
     )";
 
+const CREATE_AUTHORIZED_CHAT_SENDERS_TABLE: &str = "\
+    CREATE TABLE IF NOT EXISTS authorized_chat_senders (
+        provider TEXT NOT NULL,
+        sender_id TEXT NOT NULL,
+        PRIMARY KEY (provider, sender_id)
+    )";
+
 #[allow(dead_code)]
 pub(crate) const ENTRIES_CREATION_ORDER_SQL: &str = "created_at ASC, id ASC";
 
@@ -84,6 +91,7 @@ impl StoreHandle {
     pub fn initialize(&self) -> Result<(), StoreError> {
         let connection = self.open_connection()?;
         connection.execute(CREATE_ENTRIES_TABLE, [])?;
+        connection.execute(CREATE_AUTHORIZED_CHAT_SENDERS_TABLE, [])?;
 
         Ok(())
     }
@@ -182,6 +190,45 @@ impl StoreHandle {
         let deleted_count = connection.execute("DELETE FROM entries", [])?;
 
         Ok(ClearEntriesResult::new(deleted_count))
+    }
+
+    pub fn is_chat_sender_authorized(
+        &self,
+        provider: &str,
+        sender_id: &str,
+    ) -> Result<bool, StoreError> {
+        let connection = self.open_connection()?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM authorized_chat_senders WHERE provider = ?1 AND sender_id = ?2",
+            params![provider, sender_id],
+            |row| row.get(0),
+        )?;
+
+        Ok(count > 0)
+    }
+
+    pub fn authorize_chat_sender(&self, provider: &str, sender_id: &str) -> Result<(), StoreError> {
+        let connection = self.open_connection()?;
+        connection.execute(
+            "INSERT OR IGNORE INTO authorized_chat_senders (provider, sender_id) VALUES (?1, ?2)",
+            params![provider, sender_id],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn deauthorize_chat_sender(
+        &self,
+        provider: &str,
+        sender_id: &str,
+    ) -> Result<(), StoreError> {
+        let connection = self.open_connection()?;
+        connection.execute(
+            "DELETE FROM authorized_chat_senders WHERE provider = ?1 AND sender_id = ?2",
+            params![provider, sender_id],
+        )?;
+
+        Ok(())
     }
 
     fn open_connection(&self) -> Result<Connection, StoreError> {
@@ -360,7 +407,61 @@ mod tests {
         let connection = Connection::open(database.path()).expect("database should open");
         let table_names = table_names(&connection);
 
-        assert_eq!(table_names, ["entries"]);
+        assert_eq!(table_names, ["authorized_chat_senders", "entries"]);
+    }
+
+    #[test]
+    fn initialize_creates_authorized_chat_senders_table_without_metadata() {
+        let database = TestDatabase::new("creates_authorized_chat_senders_table");
+        let store = StoreHandle::new(database.path());
+
+        store.initialize().expect("store should initialize");
+
+        let connection = Connection::open(database.path()).expect("database should open");
+        let columns = table_columns(&connection, "authorized_chat_senders");
+
+        assert_eq!(columns, ["provider", "sender_id"]);
+    }
+
+    #[test]
+    fn chat_sender_authorization_is_idempotent_and_provider_scoped() {
+        let database = TestDatabase::new("chat_auth_provider_scoped");
+        let store = StoreHandle::new(database.path());
+        store.initialize().expect("store should initialize");
+
+        assert!(
+            !store
+                .is_chat_sender_authorized("whatsapp", "sender-1")
+                .expect("auth lookup should succeed")
+        );
+
+        store
+            .authorize_chat_sender("whatsapp", "sender-1")
+            .expect("sender should authorize");
+        store
+            .authorize_chat_sender("whatsapp", "sender-1")
+            .expect("repeated authorization should succeed");
+
+        assert!(
+            store
+                .is_chat_sender_authorized("whatsapp", "sender-1")
+                .expect("auth lookup should succeed")
+        );
+        assert!(
+            !store
+                .is_chat_sender_authorized("telegram", "sender-1")
+                .expect("auth lookup should succeed")
+        );
+
+        store
+            .deauthorize_chat_sender("whatsapp", "sender-1")
+            .expect("sender should deauthorize");
+
+        assert!(
+            !store
+                .is_chat_sender_authorized("whatsapp", "sender-1")
+                .expect("auth lookup should succeed")
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ fallback, or backward-compatibility layers unless explicitly requested.
 Implemented:
 
 - Runtime configuration from environment variables.
+- Chat-level authorization with `/login` and `/logout`.
 - Axum startup that binds `BIND_ADDR` and serves the router.
 - SQLite `entries` table initialization and list operations.
 - Message text toggling that adds missing entries and removes existing entries.
@@ -100,6 +101,7 @@ provider group is configured or the active WhatsApp group is incomplete.
 
 Optional environment variables:
 
+- `CHAT_AUTH_KEY`: preshared chat login key. Senders must send `/login <CHAT_AUTH_KEY>` before any list command or item text is accepted. If omitted, no sender can log in until it is set and the service restarts.
 - `DATABASE_PATH`: SQLite database path, default `list.db`.
 - `BIND_ADDR`: server bind address, default `127.0.0.1:3000`. For cloud
   hosting, use an address suitable for the platform, often `0.0.0.0:$PORT` when
@@ -109,6 +111,7 @@ Example local setup with placeholder values:
 
 ```sh
 export WEBHOOK_KEY="replace-with-operator-chosen-webhook-key"
+export CHAT_AUTH_KEY="replace-with-preshared-chat-login-key"
 export WHATSAPP_ACCESS_TOKEN="replace-with-meta-access-token"
 export WHATSAPP_PHONE_NUMBER_ID="replace-with-meta-phone-number-id"
 export TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token"
@@ -121,6 +124,7 @@ Example Telegram setup with placeholder values:
 
 ```sh
 export WEBHOOK_KEY="replace-with-telegram-compatible-webhook-key"
+export CHAT_AUTH_KEY="replace-with-preshared-chat-login-key"
 export TELEGRAM_BOT_TOKEN="replace-with-botfather-token"
 export TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token"
 export PUBLIC_BASE_URL="https://example.test"
@@ -180,9 +184,10 @@ curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
   --data-binary "{\"url\":\"$PUBLIC_BASE_URL/webhooks/telegram\",\"secret_token\":\"$WEBHOOK_KEY\",\"allowed_updates\":[\"message\"]}"
 ```
 
-After registration, message the bot in Telegram. Telegram should POST the update
-to `/webhooks/telegram`; the service validates the secret header, mutates the
-list, and replies with `sendMessage`.
+After registration, message the bot in Telegram and send `/login <CHAT_AUTH_KEY>`.
+Telegram should POST the update to `/webhooks/telegram`; the service validates
+the secret header, authorizes the sender, then accepts later list mutations and
+replies with `sendMessage`.
 
 Telegram mode handles normal `message.text` updates from any chat type delivered
 to the bot. Edited messages, channel posts, non-text updates, and incomplete
@@ -322,10 +327,12 @@ RUSTC_WRAPPER= cargo nextest run
 - WhatsApp mode: `GET /webhooks/whatsapp` verifies Meta's `hub.verify_token`
   against `WEBHOOK_KEY` and returns `hub.challenge` on a match.
 - WhatsApp mode: `POST /webhooks/whatsapp` parses inbound WhatsApp text messages,
-  toggles the matching list entry, and replies through the Meta Graph API.
+  requires sender login before list access, toggles matching list entries, and
+  replies through the Meta Graph API.
 - Telegram mode: `POST /webhooks/telegram` requires
   `X-Telegram-Bot-Api-Secret-Token: WEBHOOK_KEY`, parses inbound `message.text`
-  updates, toggles the matching list entry, and replies through `sendMessage`.
+  updates, requires sender login before list access, toggles matching list
+  entries, and replies through `sendMessage`.
 - `GET /api/setup`: accepts a TRMNL firmware `ID` header and returns setup JSON
   including `api_key`, `friendly_id`, `image_url`, and `filename`.
 - `GET /api/display`: requires TRMNL firmware `ID` and `Access-Token` headers

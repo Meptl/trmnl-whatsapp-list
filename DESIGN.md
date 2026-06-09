@@ -6,13 +6,20 @@ The service owns one shared text list. It does not model users, per-chat lists,
 grocery-specific concepts, permissions beyond shared endpoint tokens, or
 cross-provider transport abstractions.
 
-Non-empty active-provider text is treated as a list entry toggle by default. If the
-trimmed text is not present, it is added. If it is already present, it is
-removed. Matching uses exact text first, then case-insensitive text if no exact
-match exists.
+Senders must authorize before list access by sending `/login <CHAT_AUTH_KEY>`.
+`/logout` removes only that sender's authorization. Unauthorized messages,
+including wrong or malformed login attempts, are silent and do not mutate the
+list.
 
-Slash commands are reserved for list operations:
+Non-empty authorized active-provider text is treated as a list entry toggle by
+default. If the trimmed text is not present, it is added. If it is already
+present, it is removed. Matching uses exact text first, then case-insensitive
+text if no exact match exists.
 
+Slash commands are reserved for chat auth and list operations:
+
+- `/login <CHAT_AUTH_KEY>`
+- `/logout`
 - `/list`
 - `/clear`
 
@@ -22,6 +29,8 @@ SQLite is initialized directly at startup. The schema is intentionally small:
 
 - table: `entries`
 - columns: `id`, `text`, `created_at`
+- table: `authorized_chat_senders`
+- columns: `provider`, `sender_id`
 
 There is no migration framework. If the schema needs to change, that should be a
 separate explicitly approved task with a direct plan for existing local data.
@@ -39,18 +48,19 @@ Persistence owns exact storage and deterministic list mutations. Text trimming
 and message interpretation belong outside the store.
 
 Provider payload parsing owns provider webhook JSON shapes only. WhatsApp parsing
-extracts inbound text messages and ignores unsupported non-text or status-only
-payloads. Telegram parsing extracts normal `message.text` updates and ignores
-edited messages, channel posts, non-text updates, incomplete updates, and
-unsupported top-level shapes.
+extracts inbound text messages and uses `from` as the auth sender id. Telegram
+parsing extracts normal `message.text` updates, uses `message.from.id` as the
+auth sender id, keeps `message.chat.id` as the reply target, and ignores edited
+messages, channel posts, non-text updates, incomplete updates, and unsupported
+top-level shapes.
 
 Provider reply clients own request construction and sending. WhatsApp uses the
 Meta Graph API. Telegram uses the official Bot API `sendMessage` endpoint. The
 app runs exactly one configured provider and does not provide fallback transports.
 
 HTTP handlers own route-level behavior and should compose configuration, store,
-message execution, payload parsing, and transport clients without moving domain
-rules into Axum-specific code.
+chat auth gating, message execution, payload parsing, and transport clients
+without moving domain rules into Axum-specific code.
 
 
 ## Messaging Providers
