@@ -7,9 +7,8 @@ use axum::{Json, Router};
 use image::ImageEncoder;
 use serde::{Deserialize, Serialize};
 
-use crate::app::{AppState, MessagingClient};
+use crate::app::AppState;
 use crate::commands::CommandExecutionError;
-use crate::config::MessagingProviderConfig;
 use crate::messaging::process_inbound_text_messages;
 use crate::store::{Entry, StoreHandle};
 use crate::telegram::{
@@ -22,27 +21,24 @@ use crate::whatsapp::{
 };
 
 pub fn router(state: AppState) -> Router {
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/api/setup", get(trmnl_setup))
         .route("/api/display", get(trmnl_display))
         .route("/trmnl/list.png", get(trmnl_image_route))
         .route("/api/log", post(trmnl_log));
 
-    if matches!(
-        state.config.messaging_provider,
-        MessagingProviderConfig::WhatsApp(_)
-    ) {
-        router
-            .route(
-                "/webhooks/whatsapp",
-                get(whatsapp_verify).post(whatsapp_webhook),
-            )
-            .with_state(state)
-    } else {
-        router
-            .route("/webhooks/telegram", post(telegram_webhook))
-            .with_state(state)
+    if state.config.messaging_provider.has_whatsapp() {
+        router = router.route(
+            "/webhooks/whatsapp",
+            get(whatsapp_verify).post(whatsapp_webhook),
+        );
     }
+
+    if state.config.messaging_provider.has_telegram() {
+        router = router.route("/webhooks/telegram", post(telegram_webhook));
+    }
+
+    router.with_state(state)
 }
 
 #[derive(Deserialize)]
@@ -217,7 +213,7 @@ async fn whatsapp_verify(
 }
 
 async fn whatsapp_webhook(State(state): State<AppState>, body: String) -> StatusCode {
-    let MessagingClient::WhatsApp(client) = state.messaging_client.clone() else {
+    let Some(client) = state.messaging_client.whatsapp() else {
         return StatusCode::INTERNAL_SERVER_ERROR;
     };
 
@@ -280,7 +276,7 @@ async fn telegram_webhook(
         _ => return StatusCode::FORBIDDEN,
     }
 
-    let MessagingClient::Telegram(client) = state.messaging_client.clone() else {
+    let Some(client) = state.messaging_client.telegram() else {
         return StatusCode::INTERNAL_SERVER_ERROR;
     };
 
@@ -2011,6 +2007,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn both_provider_webhooks_update_same_list() {
+        let database = TestDatabase::new("both_provider_webhooks_update_same_list");
+        let state = initialized_both_state(&database);
+        state
+            .store
+            .authorize_chat_sender("whatsapp", "15550000001")
+            .expect("WhatsApp sender should authorize");
+        state
+            .store
+            .authorize_chat_sender("telegram", "999")
+            .expect("Telegram sender should authorize");
+        let mut whatsapp_replies = Vec::new();
+        let mut telegram_replies = Vec::new();
+
+        let whatsapp_status = whatsapp_webhook_with_reply_sender(
+            State(state.clone()),
+            single_message_payload("15550000001", "milk"),
+            |sender, reply| {
+                whatsapp_replies.push((sender, reply));
+                async { Ok(()) }
+            },
+        )
+        .await;
+        let telegram_status = telegram_webhook_with_reply_sender(
+            State(state.clone()),
+            telegram_headers_with_secret("webhook-secret"),
+            telegram_message_payload("-12345", "eggs"),
+            |chat_id, reply| {
+                telegram_replies.push((chat_id, reply));
+                async { Ok(()) }
+            },
+        )
+        .await;
+
+        assert_eq!(whatsapp_status, StatusCode::OK);
+        assert_eq!(telegram_status, StatusCode::OK);
+        assert_eq!(
+            whatsapp_replies,
+            [(
+                "15550000001".to_owned(),
+                "\"milk\" added to list.".to_owned()
+            )]
+        );
+        assert_eq!(
+            telegram_replies,
+            [("-12345".to_owned(), "\"eggs\" added to list.".to_owned())]
+        );
+        let entries = state.store.list_entries().expect("entries should list");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].text(), "milk");
+        assert_eq!(entries[1].text(), "eggs");
+    }
+
+    #[tokio::test]
+    async fn both_provider_handlers_select_their_clients() {
+        let state = AppState::new_uninitialized(both_test_config());
+
+        assert_eq!(
+            whatsapp_webhook(State(state.clone()), "{".to_owned()).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            telegram_webhook(
+                State(state),
+                telegram_headers_with_secret("webhook-secret"),
+                "{".to_owned(),
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
     async fn telegram_webhook_ignores_unsupported_updates() {
         let database = TestDatabase::new("telegram_webhook_ignores_update");
         let state = initialized_telegram_state(&database);
@@ -2287,6 +2356,28 @@ mod tests {
         }
     }
 
+    fn both_test_config() -> AppConfig {
+        AppConfig {
+            webhook_key: SecretString::from_test_value("webhook-secret"),
+            chat_auth_key: Some(SecretString::from_test_value("chat-secret")),
+            messaging_provider: MessagingProviderConfig::Both {
+                whatsapp: WhatsAppConfig {
+                    access_token: SecretString::from_test_value("access-secret"),
+                    phone_number_id: "phone-number".to_owned(),
+                },
+                telegram: TelegramConfig {
+                    bot_token: SecretString::from_test_value("bot-secret"),
+                },
+            },
+            trmnl: TrmnlConfig {
+                token: SecretString::from_test_value("trmnl-secret"),
+            },
+            public_base_url: "https://example.test".to_owned(),
+            database_path: PathBuf::from("list.db"),
+            bind_addr: "127.0.0.1:3000".to_owned(),
+        }
+    }
+
     fn initialized_state(database: &TestDatabase) -> AppState {
         let mut config = test_config();
         config.database_path = database.path().to_path_buf();
@@ -2296,6 +2387,13 @@ mod tests {
 
     fn initialized_telegram_state(database: &TestDatabase) -> AppState {
         let mut config = telegram_test_config();
+        config.database_path = database.path().to_path_buf();
+
+        AppState::new(config).expect("app state should initialize")
+    }
+
+    fn initialized_both_state(database: &TestDatabase) -> AppState {
+        let mut config = both_test_config();
         config.database_path = database.path().to_path_buf();
 
         AppState::new(config).expect("app state should initialize")

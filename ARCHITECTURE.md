@@ -3,7 +3,7 @@
 ## Purpose
 
 `trmnl-whatsapp-list` is a small Rust 2024 service for one shared list of text
-entries. It is designed so messages from exactly one active provider, WhatsApp or
+entries. It is designed so messages from any configured provider, WhatsApp and/or
 Telegram, toggle list entries, and a TRMNL device in BYOS mode displays the
 current list.
 
@@ -16,8 +16,8 @@ The implemented foundation currently includes:
 
 - Crate-level `#![forbid(unsafe_code)]`.
 - Runtime configuration loaded from environment variables, including
-  WhatsApp-or-Telegram provider selection with Telegram preferred when both are
-  configured and optional `CHAT_AUTH_KEY` chat login configuration.
+  WhatsApp and/or Telegram provider setup and optional `CHAT_AUTH_KEY` chat
+  login configuration.
 - Secret wrapper debug output that redacts token values.
 - Axum startup that loads configuration, initializes application state, binds
   `BIND_ADDR`, and serves requests.
@@ -47,12 +47,12 @@ Required common environment variables:
 - `TRMNL_TOKEN`
 - `PUBLIC_BASE_URL`
 
-Required WhatsApp mode variables:
+Required WhatsApp provider variables:
 
 - `WHATSAPP_ACCESS_TOKEN`
 - `WHATSAPP_PHONE_NUMBER_ID`
 
-Required Telegram mode variables:
+Required Telegram provider variables:
 
 - `TELEGRAM_BOT_TOKEN`
 
@@ -73,11 +73,11 @@ URL. `BIND_ADDR` should match the hosting platform; cloud hosts often require
 `0.0.0.0:$PORT` when they inject `PORT`.
 
 Missing common required variables return `ConfigError::MissingRequiredVariable`
-with the variable name. Provider inference prefers Telegram when both provider
-groups are configured and returns typed errors for missing or incomplete
-provider groups. Invalid Unicode in environment keys or values returns
-`ConfigError::InvalidUnicode`. Secret values are stored in `SecretString`, whose
-`Debug` implementation prints only `[redacted]`.
+with the variable name. Provider inference enables every complete provider group
+and returns typed errors for missing provider groups or for an incomplete
+WhatsApp-only provider group. Invalid Unicode in environment keys or values
+returns `ConfigError::InvalidUnicode`. Secret values are stored in
+`SecretString`, whose `Debug` implementation prints only `[redacted]`.
 
 Tests use `AppConfig::from_pairs` so configuration behavior can be verified
 without mutating process-global environment variables.
@@ -88,15 +88,16 @@ The service is split into these responsibilities:
 
 - Startup loads `AppConfig`, initializes `AppState`, builds the Axum router,
   binds `BIND_ADDR`, and serves requests.
-- `AppState` owns shared configuration, a SQLite store handle, and the active
-  provider reply client.
+- `AppState` owns shared configuration, a SQLite store handle, and configured
+  provider reply clients.
 - Persistence uses `rusqlite` directly against `DATABASE_PATH` and initializes
   the schema with `CREATE TABLE IF NOT EXISTS`.
 - Message interpretation, chat auth gating, and execution stay independent of
   provider payload shapes, provider transports, and HTTP handlers.
 - WhatsApp integration targets the official Meta WhatsApp Cloud API only.
 - Telegram integration targets the official Telegram Bot API only.
-- Only the active provider webhook route is registered; when both provider credential groups are configured, Telegram is active.
+- Every complete provider webhook route is registered; when both provider
+  credential groups are configured, both are active.
 - TRMNL integration exposes BYOS display, PNG image, and telemetry endpoints.
 
 ## Data Model
@@ -137,10 +138,10 @@ The common Axum routes are:
 - `GET /trmnl/list.png`
 - `POST /api/log`
 
-Provider routes are active-provider dependent:
+Provider routes depend on which provider credential groups are complete:
 
-- WhatsApp mode: `GET /webhooks/whatsapp` and `POST /webhooks/whatsapp`
-- Telegram mode: `POST /webhooks/telegram`
+- WhatsApp configured: `GET /webhooks/whatsapp` and `POST /webhooks/whatsapp`
+- Telegram configured: `POST /webhooks/telegram`
 
 TRMNL display, image, and log endpoints require firmware headers. `ID` is
 required for all TRMNL BYOS endpoints. `Access-Token` is required for display,
@@ -209,13 +210,13 @@ omits the bot token.
 
 ## Message Behavior
 
-Inbound text from either provider is ignored until that provider sender id is
+Inbound text from any configured provider is ignored until that provider sender id is
 authorized. `/login <CHAT_AUTH_KEY>` authorizes a sender, `/logout` removes that
 sender's authorization, and wrong or malformed login attempts are silent. If
 `CHAT_AUTH_KEY` is omitted, no sender can log in until the variable is set and
 the service restarts.
 
-Non-empty authorized inbound text from either provider toggles the matching list
+Non-empty authorized inbound text from any configured provider toggles the matching list
 entry:
 
 - if the trimmed text is absent, add it and reply `"text" added to list.`

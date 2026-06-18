@@ -11,7 +11,7 @@ Senders must authorize before list access by sending `/login <CHAT_AUTH_KEY>`.
 including wrong or malformed login attempts, are silent and do not mutate the
 list.
 
-Non-empty authorized active-provider text is treated as a list entry toggle by
+Non-empty authorized configured-provider text is treated as a list entry toggle by
 default. If the trimmed text is not present, it is added. If it is already
 present, it is removed. Matching uses exact text first, then case-insensitive
 text if no exact match exists.
@@ -56,7 +56,8 @@ top-level shapes.
 
 Provider reply clients own request construction and sending. WhatsApp uses the
 Meta Graph API. Telegram uses the official Bot API `sendMessage` endpoint. The
-app runs exactly one configured provider and does not provide fallback transports.
+app runs every configured provider with complete credentials and does not provide
+fallback transports.
 
 HTTP handlers own route-level behavior and should compose configuration, store,
 chat auth gating, message execution, payload parsing, and transport clients
@@ -65,21 +66,23 @@ without moving domain rules into Axum-specific code.
 
 ## Messaging Providers
 
-The service runs in one active provider mode per deployment. Provider mode is
-inferred from environment variables:
+The service registers every provider webhook whose required environment
+variables are complete:
 
-- Telegram mode: `WEBHOOK_KEY` and `TELEGRAM_BOT_TOKEN`.
-- WhatsApp mode: `WEBHOOK_KEY`, `WHATSAPP_ACCESS_TOKEN`, and
+- Telegram provider: `WEBHOOK_KEY` and `TELEGRAM_BOT_TOKEN`.
+- WhatsApp provider: `WEBHOOK_KEY`, `WHATSAPP_ACCESS_TOKEN`, and
   `WHATSAPP_PHONE_NUMBER_ID`.
 
-Telegram mode is preferred when both provider groups are present. Startup fails
-if neither provider group is present or if Telegram is absent and the WhatsApp
-group is incomplete. `WHATSAPP_VERIFY_TOKEN` is intentionally not a
-compatibility alias; use `WEBHOOK_KEY`.
+When both provider groups are present, both WhatsApp and Telegram endpoints are
+active and both update the same shared list. Startup fails if neither provider
+group is present or if WhatsApp is the only provider and its group is incomplete.
+If Telegram is complete and the WhatsApp group is incomplete, Telegram still
+starts by itself. `WHATSAPP_VERIFY_TOKEN` is intentionally not a compatibility
+alias; use `WEBHOOK_KEY`.
 
 WhatsApp exposes `GET/POST /webhooks/whatsapp`. Telegram exposes
 `POST /webhooks/telegram` and requires `X-Telegram-Bot-Api-Secret-Token` to
-match `WEBHOOK_KEY`. Only the active provider route is registered.
+match `WEBHOOK_KEY`. Each complete provider group registers its endpoint.
 
 ## TRMNL BYOS
 
@@ -119,7 +122,7 @@ header to match the server-side `TRMNL_TOKEN`.
 ## Compatibility
 
 Do not add fallback methods, provider compatibility layers, legacy aliases, or
-backward-compatibility paths unless the user explicitly requests them. Exactly
-one messaging provider is active per deployment, with Telegram preferred when
-both provider credential groups exist. Prefer replacing incomplete approaches
-with the intended implementation over supporting both old and new behavior.
+backward-compatibility paths unless the user explicitly requests them. Each
+complete provider credential group can be active in the same deployment. Prefer
+replacing incomplete approaches with the intended implementation over supporting
+both old and new behavior.

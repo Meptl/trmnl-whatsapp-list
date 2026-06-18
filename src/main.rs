@@ -40,6 +40,9 @@ fn webhook_mode_message(provider: &config::MessagingProviderConfig) -> &'static 
     match provider {
         config::MessagingProviderConfig::WhatsApp(_) => "WhatsApp (/webhooks/whatsapp)",
         config::MessagingProviderConfig::Telegram(_) => "Telegram (/webhooks/telegram)",
+        config::MessagingProviderConfig::Both { .. } => {
+            "WhatsApp (/webhooks/whatsapp), Telegram (/webhooks/telegram)"
+        }
     }
 }
 
@@ -134,6 +137,24 @@ mod tests {
         assert_eq!(
             webhook_mode_message(&provider),
             "Telegram (/webhooks/telegram)"
+        );
+    }
+
+    #[test]
+    fn webhook_mode_message_names_both_routes() {
+        let provider = MessagingProviderConfig::Both {
+            whatsapp: WhatsAppConfig {
+                access_token: SecretString::from_test_value("access-secret"),
+                phone_number_id: "phone-number".to_owned(),
+            },
+            telegram: TelegramConfig {
+                bot_token: SecretString::from_test_value("bot-secret"),
+            },
+        };
+
+        assert_eq!(
+            webhook_mode_message(&provider),
+            "WhatsApp (/webhooks/whatsapp), Telegram (/webhooks/telegram)"
         );
     }
 

@@ -32,6 +32,20 @@ pub struct AppConfig {
 pub enum MessagingProviderConfig {
     WhatsApp(WhatsAppConfig),
     Telegram(TelegramConfig),
+    Both {
+        whatsapp: WhatsAppConfig,
+        telegram: TelegramConfig,
+    },
+}
+
+impl MessagingProviderConfig {
+    pub fn has_whatsapp(&self) -> bool {
+        matches!(self, Self::WhatsApp(_) | Self::Both { .. })
+    }
+
+    pub fn has_telegram(&self) -> bool {
+        matches!(self, Self::Telegram(_) | Self::Both { .. })
+    }
 }
 
 #[derive(Clone)]
@@ -96,6 +110,11 @@ impl fmt::Debug for MessagingProviderConfig {
             Self::Telegram(config) => formatter
                 .debug_tuple("MessagingProviderConfig::Telegram")
                 .field(config)
+                .finish(),
+            Self::Both { whatsapp, telegram } => formatter
+                .debug_struct("MessagingProviderConfig::Both")
+                .field("whatsapp", whatsapp)
+                .field("telegram", telegram)
                 .finish(),
         }
     }
@@ -206,23 +225,30 @@ fn messaging_provider_from_source(
     let whatsapp_phone_number_id = source.optional(WHATSAPP_PHONE_NUMBER_ID)?;
     let telegram_bot_token = source.optional(TELEGRAM_BOT_TOKEN)?;
 
-    if let Some(bot_token) = telegram_bot_token {
-        return Ok(MessagingProviderConfig::Telegram(TelegramConfig {
-            bot_token: SecretString(bot_token),
-        }));
-    }
-
-    match (whatsapp_access_token, whatsapp_phone_number_id) {
-        (Some(access_token), Some(phone_number_id)) => {
-            Ok(MessagingProviderConfig::WhatsApp(WhatsAppConfig {
-                access_token: SecretString(access_token),
-                phone_number_id,
-            }))
-        }
-        (None, None) => Err(ConfigError::MissingMessagingProvider),
-        _ => Err(ConfigError::IncompleteMessagingProvider {
-            provider: "WhatsApp",
+    let telegram = telegram_bot_token.map(|bot_token| TelegramConfig {
+        bot_token: SecretString(bot_token),
+    });
+    let whatsapp = match (whatsapp_access_token, whatsapp_phone_number_id) {
+        (Some(access_token), Some(phone_number_id)) => Some(WhatsAppConfig {
+            access_token: SecretString(access_token),
+            phone_number_id,
         }),
+        (None, None) => None,
+        _ if telegram.is_some() => None,
+        _ => {
+            return Err(ConfigError::IncompleteMessagingProvider {
+                provider: "WhatsApp",
+            });
+        }
+    };
+
+    match (whatsapp, telegram) {
+        (Some(whatsapp), Some(telegram)) => {
+            Ok(MessagingProviderConfig::Both { whatsapp, telegram })
+        }
+        (Some(whatsapp), None) => Ok(MessagingProviderConfig::WhatsApp(whatsapp)),
+        (None, Some(telegram)) => Ok(MessagingProviderConfig::Telegram(telegram)),
+        (None, None) => Err(ConfigError::MissingMessagingProvider),
     }
 }
 
@@ -352,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn telegram_provider_is_preferred_when_both_provider_groups_exist() {
+    fn both_providers_load_when_both_provider_groups_exist() {
         let config = AppConfig::from_pairs(
             COMMON_ENV
                 .into_iter()
@@ -361,14 +387,16 @@ mod tests {
         )
         .expect("config should load");
 
-        let MessagingProviderConfig::Telegram(telegram) = config.messaging_provider else {
-            panic!("Telegram config should be preferred");
+        let MessagingProviderConfig::Both { whatsapp, telegram } = config.messaging_provider else {
+            panic!("both provider configs should load");
         };
+        assert_eq!(whatsapp.access_token.as_str(), "access-secret");
+        assert_eq!(whatsapp.phone_number_id, "phone-number");
         assert_eq!(telegram.bot_token.as_str(), "bot-secret");
     }
 
     #[test]
-    fn telegram_provider_is_preferred_over_incomplete_whatsapp_group() {
+    fn incomplete_whatsapp_group_is_ignored_when_telegram_can_load() {
         let config = AppConfig::from_pairs(
             COMMON_ENV
                 .into_iter()
@@ -378,7 +406,7 @@ mod tests {
         .expect("config should load");
 
         let MessagingProviderConfig::Telegram(telegram) = config.messaging_provider else {
-            panic!("Telegram config should be preferred");
+            panic!("Telegram config should load");
         };
         assert_eq!(telegram.bot_token.as_str(), "bot-secret");
     }

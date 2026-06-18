@@ -14,6 +14,10 @@ pub struct AppState {
 pub enum MessagingClient {
     WhatsApp(WhatsAppReplyClient),
     Telegram(TelegramReplyClient),
+    Both {
+        whatsapp: WhatsAppReplyClient,
+        telegram: TelegramReplyClient,
+    },
 }
 
 impl MessagingClient {
@@ -25,6 +29,26 @@ impl MessagingClient {
             MessagingProviderConfig::Telegram(config) => {
                 Self::Telegram(TelegramReplyClient::new(config))
             }
+            MessagingProviderConfig::Both { whatsapp, telegram } => Self::Both {
+                whatsapp: WhatsAppReplyClient::new(whatsapp),
+                telegram: TelegramReplyClient::new(telegram),
+            },
+        }
+    }
+
+    pub fn whatsapp(&self) -> Option<WhatsAppReplyClient> {
+        match self {
+            Self::WhatsApp(client) => Some(client.clone()),
+            Self::Both { whatsapp, .. } => Some(whatsapp.clone()),
+            Self::Telegram(_) => None,
+        }
+    }
+
+    pub fn telegram(&self) -> Option<TelegramReplyClient> {
+        match self {
+            Self::Telegram(client) => Some(client.clone()),
+            Self::Both { telegram, .. } => Some(telegram.clone()),
+            Self::WhatsApp(_) => None,
         }
     }
 }
@@ -105,6 +129,34 @@ mod tests {
             state.messaging_client,
             MessagingClient::Telegram(_)
         ));
+
+        fs::remove_file(config.database_path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn app_state_contains_both_clients_for_both_provider_mode() {
+        let database_path = temporary_database_path("app_state_both");
+        let config = test_config(
+            database_path,
+            MessagingProviderConfig::Both {
+                whatsapp: WhatsAppConfig {
+                    access_token: SecretString::from_test_value("access-secret"),
+                    phone_number_id: "phone-number".to_owned(),
+                },
+                telegram: TelegramConfig {
+                    bot_token: SecretString::from_test_value("bot-secret"),
+                },
+            },
+        );
+
+        let state = AppState::new(config.clone()).expect("app state should initialize");
+
+        assert!(matches!(
+            state.messaging_client,
+            MessagingClient::Both { .. }
+        ));
+        assert!(state.messaging_client.whatsapp().is_some());
+        assert!(state.messaging_client.telegram().is_some());
 
         fs::remove_file(config.database_path).expect("test database should be removed");
     }
