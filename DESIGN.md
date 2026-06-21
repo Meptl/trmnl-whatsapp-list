@@ -66,6 +66,12 @@ without moving domain rules into Axum-specific code.
 
 ## Messaging Providers
 
+Google Calendar credentials are required for startup:
+
+- `GOOGLE_CALENDAR_CLIENT_ID`
+- `GOOGLE_CALENDAR_CLIENT_SECRET`
+- `GOOGLE_CALENDAR_REFRESH_TOKEN`
+
 The service registers every provider webhook whose required environment
 variables are complete:
 
@@ -112,9 +118,20 @@ uses to fetch returned image URLs. Cloud deployments should bind on an address
 appropriate for the host, often `0.0.0.0:$PORT` when the platform injects
 `PORT`.
 
-Display content should stay e-ink friendly: a top navigation spacer with the
-list title and battery indicator, current entries in creation order, and an
-empty state.
+Display content should stay e-ink friendly: the battery indicator, the current
+list in creation order on the left, and today's Google Calendar events on the
+right. The calendar pane is titled `Events - MON DD`, using today's calendar
+month and day. All-day events render as `ALL DAY EVENT_TITLE`; timed events render in
+chronological 24-hour local form such as `09:30 EVENT_TITLE`. Long titles wrap
+with continuation lines indented after the time or all-day prefix.
+
+Google Calendar access uses OAuth refresh-token credentials from environment
+variables and the Calendar readonly scope. The service reads the authenticated
+user's selected, non-hidden calendars, determines today from the primary
+calendar timezone, and fetches live calendar data during display metadata and
+image requests. Calendar data is not persisted. Runtime token or Calendar API
+failures do not fail TRMNL rendering; the list still renders and the calendar
+pane shows `Events unavailable`.
 
 TRMNL display, image, and log endpoints require the firmware `Access-Token`
 header to match the server-side `TRMNL_TOKEN`.

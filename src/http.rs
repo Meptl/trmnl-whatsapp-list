@@ -8,6 +8,9 @@ use image::ImageEncoder;
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
+#[cfg(test)]
+use crate::calendar::CalendarDisplayEvent;
+use crate::calendar::{CalendarDisplayDay, GoogleCalendarClient};
 use crate::commands::CommandExecutionError;
 use crate::messaging::process_inbound_text_messages;
 use crate::store::{Entry, StoreHandle};
@@ -351,8 +354,12 @@ async fn trmnl_setup(
         &state.config.public_base_url,
         firmware_headers.battery_voltage.as_deref(),
     );
-    let filename =
-        trmnl_display_filename(&state.store, firmware_headers.battery_voltage.as_deref())?;
+    let calendar_pane = calendar_pane_data(&state.calendar_client).await;
+    let filename = trmnl_display_filename(
+        &state.store,
+        firmware_headers.battery_voltage.as_deref(),
+        &calendar_pane,
+    )?;
     log_trmnl_success("/api/setup", &firmware_headers, StatusCode::OK);
 
     Ok(Json(TrmnlSetupResponse::new(
@@ -415,8 +422,12 @@ async fn trmnl_display(
         &state.config.public_base_url,
         firmware_headers.battery_voltage.as_deref(),
     );
-    let filename =
-        trmnl_display_filename(&state.store, firmware_headers.battery_voltage.as_deref())?;
+    let calendar_pane = calendar_pane_data(&state.calendar_client).await;
+    let filename = trmnl_display_filename(
+        &state.store,
+        firmware_headers.battery_voltage.as_deref(),
+        &calendar_pane,
+    )?;
     log_trmnl_success("/api/display", &firmware_headers, StatusCode::OK);
 
     Ok(Json(TrmnlDisplayResponse::new(image_url, filename)))
@@ -433,15 +444,24 @@ fn trmnl_image_url(public_base_url: &str, battery_voltage: Option<&str>) -> Stri
 fn trmnl_display_filename(
     store: &StoreHandle,
     battery_voltage: Option<&str>,
+    calendar_pane: &CalendarPaneData,
 ) -> Result<String, StatusCode> {
     let entries = store
         .list_entries()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(trmnl_list_filename(&entries, battery_voltage))
+    Ok(trmnl_list_filename(
+        &entries,
+        battery_voltage,
+        calendar_pane,
+    ))
 }
 
-fn trmnl_list_filename(entries: &[Entry], battery_voltage: Option<&str>) -> String {
+fn trmnl_list_filename(
+    entries: &[Entry],
+    battery_voltage: Option<&str>,
+    calendar_pane: &CalendarPaneData,
+) -> String {
     let battery = battery_filename_part(battery_voltage);
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for entry in entries {
@@ -452,8 +472,27 @@ fn trmnl_list_filename(entries: &[Entry], battery_voltage: Option<&str>) -> Stri
         hash_filename_bytes(&mut hash, b"created_at");
         hash_filename_field(&mut hash, entry.created_at().as_bytes());
     }
+    hash_calendar_pane(&mut hash, calendar_pane);
 
     format!("list-bat{battery}-{hash:016x}.png")
+}
+
+fn hash_calendar_pane(hash: &mut u64, calendar_pane: &CalendarPaneData) {
+    match calendar_pane {
+        CalendarPaneData::Events(day) => {
+            hash_filename_bytes(hash, b"calendar-events");
+            hash_filename_field(hash, day.date_label().as_bytes());
+            for event in day.events() {
+                for field in event.hash_fields() {
+                    hash_filename_field(hash, field.as_bytes());
+                }
+            }
+        }
+        CalendarPaneData::Unavailable { date_label } => {
+            hash_filename_bytes(hash, b"calendar-unavailable");
+            hash_filename_field(hash, date_label.as_bytes());
+        }
+    }
 }
 
 fn battery_filename_part(battery_voltage: Option<&str>) -> String {
@@ -504,7 +543,8 @@ async fn trmnl_image(
         .store
         .list_entries()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let png = render_trmnl_list_png(&entries, query.battery_voltage.as_deref())
+    let calendar_pane = calendar_pane_data(&state.calendar_client).await;
+    let png = render_trmnl_list_png(&entries, query.battery_voltage.as_deref(), &calendar_pane)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     log_trmnl_success("/trmnl/list.png", &firmware_headers, StatusCode::OK);
 
@@ -566,7 +606,47 @@ fn log_trmnl_success(route: &str, headers: &TrmnlFirmwareHeaders, status: Status
 }
 
 fn acknowledge_state_shape(state: &AppState) {
-    let _ = (&state.config, &state.store, &state.messaging_client);
+    let _ = (
+        &state.config,
+        &state.store,
+        &state.messaging_client,
+        &state.calendar_client,
+    );
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum CalendarPaneData {
+    Events(CalendarDisplayDay),
+    Unavailable { date_label: String },
+}
+
+async fn calendar_pane_data(client: &GoogleCalendarClient) -> CalendarPaneData {
+    match client.today_events().await {
+        Ok(day) => CalendarPaneData::Events(day),
+        Err(error) => {
+            eprintln!("Failed to fetch Google Calendar events: {error}");
+            CalendarPaneData::Unavailable {
+                date_label: fallback_calendar_date_label(),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn fallback_calendar_date_label() -> String {
+    "Jun 21".to_owned()
+}
+
+#[cfg(not(test))]
+fn fallback_calendar_date_label() -> String {
+    jiff::Timestamp::now().in_tz("UTC").map_or_else(
+        |_| "today".to_owned(),
+        |today| crate::calendar::calendar_date_label(today.date()),
+    )
+}
+
+fn calendar_pane_title(date_label: &str) -> String {
+    format!("Events - {date_label}")
 }
 
 const TRMNL_IMAGE_WIDTH: u32 = 800;
@@ -583,50 +663,21 @@ const WHITE: [u8; 4] = [255, 255, 255, 255];
 fn render_trmnl_list_png(
     entries: &[crate::store::Entry],
     battery_voltage: Option<&str>,
+    calendar_pane: &CalendarPaneData,
 ) -> Result<Vec<u8>, image::ImageError> {
     let mut canvas = Canvas::new(TRMNL_IMAGE_WIDTH, TRMNL_IMAGE_HEIGHT, WHITE);
 
-    canvas.draw_text("List", TRMNL_MARGIN, 24, 8, BLACK);
     draw_battery_indicator(&mut canvas, battery_voltage);
+    canvas.fill_rect(
+        TRMNL_IMAGE_WIDTH / 2,
+        92,
+        2,
+        TRMNL_IMAGE_HEIGHT - 124,
+        BLACK,
+    );
 
-    let max_chars = chars_per_line(TRMNL_IMAGE_WIDTH - (TRMNL_MARGIN * 2), FONT_SCALE);
-    let footer_y = TRMNL_IMAGE_HEIGHT - TRMNL_MARGIN;
-    let mut y = 118;
-
-    if entries.is_empty() {
-        canvas.draw_text("No entries", TRMNL_MARGIN, y, FONT_SCALE, BLACK);
-    } else {
-        for (index, entry) in entries.iter().enumerate() {
-            if y + LINE_HEIGHT > footer_y {
-                break;
-            }
-
-            let prefix = format!("{}. ", index + 1);
-            let line_width = max_chars.saturating_sub(prefix.chars().count()).max(8);
-            let lines = wrap_text(entry.text(), line_width);
-
-            for (line_index, line) in lines.iter().enumerate() {
-                if y + LINE_HEIGHT > footer_y {
-                    break;
-                }
-
-                if line_index == 0 {
-                    canvas.draw_text(
-                        &format!("{prefix}{line}"),
-                        TRMNL_MARGIN,
-                        y,
-                        FONT_SCALE,
-                        BLACK,
-                    );
-                } else {
-                    let indent = text_width(&prefix, FONT_SCALE);
-                    canvas.draw_text(line, TRMNL_MARGIN + indent, y, FONT_SCALE, BLACK);
-                }
-                y += LINE_HEIGHT;
-            }
-            y += 6;
-        }
-    }
+    draw_list_pane(&mut canvas, entries);
+    draw_calendar_pane(&mut canvas, calendar_pane);
 
     let mut png = Vec::new();
     let encoder = image::codecs::png::PngEncoder::new(&mut png);
@@ -638,6 +689,135 @@ fn render_trmnl_list_png(
     )?;
 
     Ok(png)
+}
+
+fn draw_list_pane(canvas: &mut Canvas, entries: &[crate::store::Entry]) {
+    let pane = Pane::left();
+    canvas.draw_text("Groceries", pane.x, 104, FONT_SCALE, BLACK);
+
+    if entries.is_empty() {
+        return;
+    }
+
+    let mut y = pane.content_y;
+    let max_chars = chars_per_line(pane.width, FONT_SCALE);
+    for (index, entry) in entries.iter().enumerate() {
+        if y + LINE_HEIGHT > pane.footer_y {
+            break;
+        }
+
+        let prefix = format!("{}. ", index + 1);
+        y = draw_wrapped_prefixed_text(
+            canvas,
+            pane.x,
+            y,
+            pane.footer_y,
+            max_chars,
+            &prefix,
+            entry.text(),
+        );
+        y += 6;
+    }
+}
+
+fn draw_calendar_pane(canvas: &mut Canvas, calendar_pane: &CalendarPaneData) {
+    let pane = Pane::right();
+    let title = match calendar_pane {
+        CalendarPaneData::Events(day) => calendar_pane_title(day.date_label()),
+        CalendarPaneData::Unavailable { date_label } => calendar_pane_title(date_label),
+    };
+    canvas.draw_text(&title, pane.x, 104, FONT_SCALE, BLACK);
+
+    match calendar_pane {
+        CalendarPaneData::Unavailable { .. } => {
+            canvas.draw_text(
+                "Events unavailable",
+                pane.x,
+                pane.content_y,
+                FONT_SCALE,
+                BLACK,
+            );
+        }
+        CalendarPaneData::Events(day) if day.events().is_empty() => {}
+        CalendarPaneData::Events(day) => {
+            let mut y = pane.content_y;
+            let max_chars = chars_per_line(pane.width, FONT_SCALE);
+            for event in day.events() {
+                if y + LINE_HEIGHT > pane.footer_y {
+                    break;
+                }
+
+                let prefix = format!("{} ", event.prefix());
+                y = draw_wrapped_prefixed_text(
+                    canvas,
+                    pane.x,
+                    y,
+                    pane.footer_y,
+                    max_chars,
+                    &prefix,
+                    event.title(),
+                );
+                y += 6;
+            }
+        }
+    }
+}
+
+fn draw_wrapped_prefixed_text(
+    canvas: &mut Canvas,
+    x: u32,
+    mut y: u32,
+    footer_y: u32,
+    max_chars: usize,
+    prefix: &str,
+    text: &str,
+) -> u32 {
+    let line_width = max_chars.saturating_sub(prefix.chars().count()).max(8);
+    let lines = wrap_text(text, line_width);
+
+    for (line_index, line) in lines.iter().enumerate() {
+        if y + LINE_HEIGHT > footer_y {
+            break;
+        }
+
+        if line_index == 0 {
+            canvas.draw_text(&format!("{prefix}{line}"), x, y, FONT_SCALE, BLACK);
+        } else {
+            let indent = text_width(prefix, FONT_SCALE);
+            canvas.draw_text(line, x + indent, y, FONT_SCALE, BLACK);
+        }
+        y += LINE_HEIGHT;
+    }
+
+    y
+}
+
+#[derive(Clone, Copy)]
+struct Pane {
+    x: u32,
+    width: u32,
+    content_y: u32,
+    footer_y: u32,
+}
+
+impl Pane {
+    fn left() -> Self {
+        Self {
+            x: TRMNL_MARGIN,
+            width: (TRMNL_IMAGE_WIDTH / 2) - TRMNL_MARGIN - 18,
+            content_y: 146,
+            footer_y: TRMNL_IMAGE_HEIGHT - TRMNL_MARGIN,
+        }
+    }
+
+    fn right() -> Self {
+        Self {
+            x: (TRMNL_IMAGE_WIDTH / 2) + 18,
+            width: (TRMNL_IMAGE_WIDTH / 2) - TRMNL_MARGIN - 18,
+            content_y: 146,
+            footer_y: TRMNL_IMAGE_HEIGHT - TRMNL_MARGIN,
+        }
+    }
 }
 
 fn draw_battery_indicator(canvas: &mut Canvas, battery_voltage: Option<&str>) {
@@ -1008,9 +1188,10 @@ mod tests {
     use axum::response::IntoResponse;
 
     use super::*;
+    use crate::calendar::GoogleCalendarClient;
     use crate::config::{
-        AppConfig, MessagingProviderConfig, SecretString, TelegramConfig, TrmnlConfig,
-        WhatsAppConfig,
+        AppConfig, GoogleCalendarConfig, MessagingProviderConfig, SecretString, TelegramConfig,
+        TrmnlConfig, WhatsAppConfig,
     };
 
     #[test]
@@ -1286,7 +1467,7 @@ mod tests {
                 "api_key": "trmnl-secret",
                 "friendly_id": "trmnl-ddeeff",
                 "image_url": "https://example.test/trmnl/list.png",
-                "filename": "list-batunknown-cbf29ce484222325.png",
+                "filename": "list-batunknown-e60f80290bd86160.png",
             })
         );
         assert_eq!(response.api_key, "trmnl-secret");
@@ -1358,7 +1539,7 @@ mod tests {
             serde_json::json!({
                 "status": 0,
                 "image_url": "https://example.test/trmnl/list.png",
-                "filename": "list-batunknown-cbf29ce484222325.png",
+                "filename": "list-batunknown-e60f80290bd86160.png",
                 "update_firmware": false,
                 "firmware_url": null,
                 "refresh_rate": "60",
@@ -1454,6 +1635,55 @@ mod tests {
 
         assert_ne!(original_response.filename, updated_response.filename);
         assert_firmware_safe_filename(&updated_response.filename);
+    }
+
+    #[tokio::test]
+    async fn calendar_event_changes_trmnl_display_filename() {
+        let database = TestDatabase::new("trmnl_display_calendar_changes_filename");
+        let mut config = test_config();
+        config.database_path = database.path().to_path_buf();
+        let first_state = AppState::with_calendar_client_for_tests(
+            config.clone(),
+            GoogleCalendarClient::test_with_events(vec![CalendarDisplayEvent::test_event(
+                "09:00", "Meeting",
+            )]),
+        );
+        first_state
+            .store
+            .initialize()
+            .expect("test database should initialize");
+        let second_state = AppState::with_calendar_client_for_tests(
+            config,
+            GoogleCalendarClient::test_with_events(vec![CalendarDisplayEvent::test_event(
+                "10:00", "Meeting",
+            )]),
+        );
+
+        let Json(first_response) = trmnl_display(State(first_state), valid_trmnl_headers())
+            .await
+            .expect("first display should return filename");
+        let Json(second_response) = trmnl_display(State(second_state), valid_trmnl_headers())
+            .await
+            .expect("second display should return filename");
+
+        assert_ne!(first_response.filename, second_response.filename);
+        assert_firmware_safe_filename(&second_response.filename);
+    }
+
+    #[tokio::test]
+    async fn calendar_failure_still_returns_trmnl_image() {
+        let database = TestDatabase::new("trmnl_image_calendar_unavailable");
+        let state = initialized_state(&database);
+
+        let response = trmnl_image(
+            State(state),
+            TrmnlImageQuery::default(),
+            valid_trmnl_headers(),
+        )
+        .await
+        .expect("calendar failure should not fail image rendering");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -2331,6 +2561,7 @@ mod tests {
                 access_token: SecretString::from_test_value("access-secret"),
                 phone_number_id: "phone-number".to_owned(),
             }),
+            google_calendar: test_google_calendar_config(),
             trmnl: TrmnlConfig {
                 token: SecretString::from_test_value("trmnl-secret"),
             },
@@ -2347,6 +2578,7 @@ mod tests {
             messaging_provider: MessagingProviderConfig::Telegram(TelegramConfig {
                 bot_token: SecretString::from_test_value("bot-secret"),
             }),
+            google_calendar: test_google_calendar_config(),
             trmnl: TrmnlConfig {
                 token: SecretString::from_test_value("trmnl-secret"),
             },
@@ -2369,12 +2601,21 @@ mod tests {
                     bot_token: SecretString::from_test_value("bot-secret"),
                 },
             },
+            google_calendar: test_google_calendar_config(),
             trmnl: TrmnlConfig {
                 token: SecretString::from_test_value("trmnl-secret"),
             },
             public_base_url: "https://example.test".to_owned(),
             database_path: PathBuf::from("list.db"),
             bind_addr: "127.0.0.1:3000".to_owned(),
+        }
+    }
+
+    fn test_google_calendar_config() -> GoogleCalendarConfig {
+        GoogleCalendarConfig {
+            client_id: "google-client-id".to_owned(),
+            client_secret: SecretString::from_test_value("google-client-secret"),
+            refresh_token: SecretString::from_test_value("google-refresh-token"),
         }
     }
 

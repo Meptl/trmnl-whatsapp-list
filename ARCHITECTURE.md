@@ -34,7 +34,8 @@ The implemented foundation currently includes:
   the Telegram webhook POST flow.
 - TRMNL BYOS setup response generation.
 - TRMNL BYOS display response generation.
-- TRMNL 800x480 PNG rendering for the current list.
+- Google Calendar OAuth refresh-token access and Calendar API event fetching.
+- TRMNL 800x480 split PNG rendering for the current list and today's events.
 - TRMNL telemetry acceptance for empty bodies or valid JSON.
 
 ## Configuration
@@ -55,6 +56,12 @@ Required WhatsApp provider variables:
 Required Telegram provider variables:
 
 - `TELEGRAM_BOT_TOKEN`
+
+Required Google Calendar variables:
+
+- `GOOGLE_CALENDAR_CLIENT_ID`
+- `GOOGLE_CALENDAR_CLIENT_SECRET`
+- `GOOGLE_CALENDAR_REFRESH_TOKEN`
 
 Optional environment variables:
 
@@ -94,11 +101,14 @@ The service is split into these responsibilities:
   the schema with `CREATE TABLE IF NOT EXISTS`.
 - Message interpretation, chat auth gating, and execution stay independent of
   provider payload shapes, provider transports, and HTTP handlers.
+- Google Calendar integration lives in `src/calendar.rs`, refreshes OAuth access
+  tokens on demand, reads selected visible calendars, and fetches today's events
+  live for TRMNL requests.
 - WhatsApp integration targets the official Meta WhatsApp Cloud API only.
 - Telegram integration targets the official Telegram Bot API only.
 - Every complete provider webhook route is registered; when both provider
   credential groups are configured, both are active.
-- TRMNL integration exposes BYOS display, PNG image, and telemetry endpoints.
+- TRMNL integration exposes BYOS display, split PNG image, and telemetry endpoints.
 
 ## Data Model
 
@@ -162,7 +172,7 @@ Handler behavior:
 - `GET /api/setup` returns TRMNL setup JSON with `api_key`, `friendly_id`,
   `image_url`, and `filename`.
 - `GET /api/display` returns TRMNL display JSON containing the list PNG URL.
-- `GET /trmnl/list.png` renders the current list as an 800x480 PNG.
+- `GET /trmnl/list.png` renders the current list and today's Google Calendar events as an 800x480 PNG.
 - `POST /api/log` accepts empty telemetry bodies or valid JSON and rejects
   invalid JSON.
 
@@ -207,6 +217,28 @@ https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage
 
 It sends JSON text replies with `chat_id` and `text`. Debug output intentionally
 omits the bot token.
+
+## Calendar Display
+
+`src/calendar.rs` owns Google OAuth token refresh, CalendarList pagination,
+primary-calendar timezone discovery, selected/non-hidden calendar filtering,
+event pagination, event normalization, sorting, and deduplication. The client
+uses `calendarList.list` and `events.list` with `singleEvents=true`,
+`orderBy=startTime`, `timeMin`, `timeMax`, and `timeZone`.
+
+Today's window is computed with `jiff` in the primary calendar timezone. Events
+that overlap today are rendered with all-day events first, then timed events in
+local chronological order. Timed events already in progress at local midnight
+render as `00:00`. Event deduplication uses `iCalUID` plus start time, with the
+Google event id as a defensive fallback when needed. Missing or blank summaries
+render as `Untitled event`.
+
+TRMNL display metadata and PNG image requests each fetch calendar data live. A
+successful calendar fetch contributes the calendar date label and event data to
+the display filename hash. Calendar failures are logged server-side without
+secrets, contribute an unavailable sentinel and fallback date label to the
+filename hash, and render `Events unavailable` in the right pane while preserving
+the left list.
 
 ## Message Behavior
 

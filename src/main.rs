@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod calendar;
 #[allow(dead_code)]
 mod commands;
 mod config;
@@ -104,8 +105,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::config::{
-        AppConfig, MessagingProviderConfig, SecretString, TelegramConfig, TrmnlConfig,
-        WhatsAppConfig,
+        AppConfig, GoogleCalendarConfig, MessagingProviderConfig, SecretString, TelegramConfig,
+        TrmnlConfig, WhatsAppConfig,
     };
 
     use super::*;
@@ -192,6 +193,11 @@ mod tests {
                 access_token: SecretString::from_test_value("access-secret"),
                 phone_number_id: "phone-number".to_owned(),
             }),
+            google_calendar: GoogleCalendarConfig {
+                client_id: "google-client-id".to_owned(),
+                client_secret: SecretString::from_test_value("google-client-secret"),
+                refresh_token: SecretString::from_test_value("google-refresh-token"),
+            },
             trmnl: TrmnlConfig {
                 token: SecretString::from_test_value("trmnl-secret"),
             },

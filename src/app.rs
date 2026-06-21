@@ -1,3 +1,4 @@
+use crate::calendar::GoogleCalendarClient;
 use crate::config::{AppConfig, MessagingProviderConfig};
 use crate::store::{StoreError, StoreHandle};
 use crate::telegram::TelegramReplyClient;
@@ -8,6 +9,7 @@ pub struct AppState {
     pub config: AppConfig,
     pub store: StoreHandle,
     pub messaging_client: MessagingClient,
+    pub calendar_client: GoogleCalendarClient,
 }
 
 #[derive(Clone)]
@@ -58,8 +60,14 @@ impl AppState {
         let store = StoreHandle::new(config.database_path.clone());
         store.initialize()?;
 
+        #[cfg(test)]
+        let calendar_client = GoogleCalendarClient::test_unavailable();
+        #[cfg(not(test))]
+        let calendar_client = GoogleCalendarClient::new(&config.google_calendar);
+
         Ok(Self {
             messaging_client: MessagingClient::new(&config.messaging_provider),
+            calendar_client,
             config,
             store,
         })
@@ -72,6 +80,19 @@ impl AppState {
         Self {
             store: StoreHandle::new(config.database_path.clone()),
             messaging_client: MessagingClient::new(&config.messaging_provider),
+            calendar_client: GoogleCalendarClient::test_unavailable(),
+            config,
+        }
+    }
+
+    pub fn with_calendar_client_for_tests(
+        config: AppConfig,
+        calendar_client: GoogleCalendarClient,
+    ) -> Self {
+        Self {
+            store: StoreHandle::new(config.database_path.clone()),
+            messaging_client: MessagingClient::new(&config.messaging_provider),
+            calendar_client,
             config,
         }
     }
@@ -85,7 +106,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        MessagingProviderConfig, SecretString, TelegramConfig, TrmnlConfig, WhatsAppConfig,
+        GoogleCalendarConfig, MessagingProviderConfig, SecretString, TelegramConfig, TrmnlConfig,
+        WhatsAppConfig,
     };
 
     #[test]
@@ -169,6 +191,11 @@ mod tests {
             webhook_key: SecretString::from_test_value("webhook-secret"),
             chat_auth_key: Some(SecretString::from_test_value("chat-secret")),
             messaging_provider,
+            google_calendar: GoogleCalendarConfig {
+                client_id: "google-client-id".to_owned(),
+                client_secret: SecretString::from_test_value("google-client-secret"),
+                refresh_token: SecretString::from_test_value("google-refresh-token"),
+            },
             trmnl: TrmnlConfig {
                 token: SecretString::from_test_value("trmnl-secret"),
             },

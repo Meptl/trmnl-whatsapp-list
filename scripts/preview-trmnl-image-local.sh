@@ -2,9 +2,10 @@
 set -eu
 
 # Usage:
-#   TRMNL_TOKEN=replace-with-token scripts/preview-trmnl-image.sh [http://127.0.0.1:3000]
+#   TRMNL_TOKEN=replace-with-token scripts/preview-trmnl-image-local.sh
 #
 # Optional:
+#   LOCAL_BASE_URL=http://127.0.0.1:3000
 #   DEVICE_ID=physical-or-test-device-id
 #   BATTERY_VOLTAGE=4.12
 #   OUTPUT=trmnl-list.png
@@ -29,7 +30,7 @@ if ! command -v mpv >/dev/null 2>&1; then
   exit 2
 fi
 
-base_url="${1:-http://127.0.0.1:3000}"
+base_url="${LOCAL_BASE_URL:-http://127.0.0.1:3000}"
 base_url="${base_url%/}"
 device_id="${DEVICE_ID:-test-device}"
 battery_voltage="${BATTERY_VOLTAGE:-4.12}"
@@ -51,21 +52,31 @@ curl --show-error --silent --fail \
   --output "$display_json" \
   "$base_url/api/display"
 
-echo "$base_url/api/display"
-echo $display_json
-
 image_url="$(jq -r '.image_url // empty' "$display_json")"
 if [ -z "$image_url" ]; then
   echo "display response did not include image_url" >&2
   exit 1
 fi
 
+image_path_and_query="$(printf '%s' "$image_url" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://[^/]*##')"
+case "$image_path_and_query" in
+  /*) ;;
+  *)
+    echo "display image_url did not include a fetchable path: $image_url" >&2
+    exit 1
+    ;;
+esac
+fetch_image_url="$base_url$image_path_and_query"
+
+echo "Display metadata URL: $base_url/api/display"
+echo "Returned image_url: $image_url"
+echo "Fetching preview image from local URL: $fetch_image_url"
 curl --show-error --silent --fail \
   --request GET \
   --header "ID: $device_id" \
   --header "Access-Token: $TRMNL_TOKEN" \
   --output "$output" \
-  "$image_url"
+  "$fetch_image_url"
 
 echo "Saved preview to $output"
 mpv --keep-open=yes "$output"

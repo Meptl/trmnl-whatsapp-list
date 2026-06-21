@@ -28,7 +28,7 @@ Implemented:
 - Messaging list updates and replies for configured provider webhooks.
 - TRMNL BYOS display metadata at `GET /api/display`.
 - TRMNL BYOS setup handshake at `GET /api/setup`.
-- TRMNL list PNG rendering at `GET /trmnl/list.png`.
+- TRMNL split PNG rendering at `GET /trmnl/list.png` with the shared list and today's Google Calendar events.
 - TRMNL telemetry acceptance at `POST /api/log`.
 
 ## Prerequisites
@@ -43,6 +43,8 @@ Implemented:
 - A webhook key chosen by the operator. For WhatsApp it is the Meta verify
   token; for Telegram it is the Telegram webhook `secret_token`.
 - A public HTTPS URL for configured-provider webhook delivery.
+- A Google Cloud OAuth client with Google Calendar API enabled.
+- A Google OAuth refresh token granted the `https://www.googleapis.com/auth/calendar.readonly` scope.
 - A TRMNL device configured for BYOS mode.
 - A server-side TRMNL token chosen by the operator.
 
@@ -87,6 +89,10 @@ Required common environment variables:
   on later requests as the `Access-Token` header.
 - `PUBLIC_BASE_URL`: externally reachable HTTPS base URL used when returning
   TRMNL image URLs to the physical device.
+- `GOOGLE_CALENDAR_CLIENT_ID`: OAuth client ID for Google Calendar access.
+- `GOOGLE_CALENDAR_CLIENT_SECRET`: OAuth client secret.
+- `GOOGLE_CALENDAR_REFRESH_TOKEN`: OAuth refresh token with Calendar readonly
+  scope.
 
 Required WhatsApp provider variables:
 
@@ -103,7 +109,8 @@ Set at least one provider group. When both provider groups are configured, both
 webhook endpoints are registered and both providers can update the same list.
 Startup fails if no provider group is configured or if WhatsApp is the only
 provider with an incomplete credential group. If Telegram is complete and
-WhatsApp is incomplete, the service starts with Telegram only.
+WhatsApp is incomplete, the service starts with Telegram only. Google Calendar
+configuration is required and incomplete Google credentials fail startup.
 `WHATSAPP_VERIFY_TOKEN` is not supported; use `WEBHOOK_KEY`.
 
 Optional environment variables:
@@ -125,6 +132,9 @@ export WHATSAPP_ACCESS_TOKEN="replace-with-meta-access-token"
 export WHATSAPP_PHONE_NUMBER_ID="replace-with-meta-phone-number-id"
 export TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token"
 export PUBLIC_BASE_URL="https://example.test"
+export GOOGLE_CALENDAR_CLIENT_ID="replace-with-google-oauth-client-id"
+export GOOGLE_CALENDAR_CLIENT_SECRET="replace-with-google-oauth-client-secret"
+export GOOGLE_CALENDAR_REFRESH_TOKEN="replace-with-google-refresh-token"
 export DATABASE_PATH="list.db"
 export BIND_ADDR="127.0.0.1:3000"
 ```
@@ -137,6 +147,9 @@ export CHAT_AUTH_KEY="replace-with-preshared-chat-login-key"
 export TELEGRAM_BOT_TOKEN="replace-with-botfather-token"
 export TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token"
 export PUBLIC_BASE_URL="https://example.test"
+export GOOGLE_CALENDAR_CLIENT_ID="replace-with-google-oauth-client-id"
+export GOOGLE_CALENDAR_CLIENT_SECRET="replace-with-google-oauth-client-secret"
+export GOOGLE_CALENDAR_REFRESH_TOKEN="replace-with-google-refresh-token"
 export DATABASE_PATH="list.db"
 export BIND_ADDR="127.0.0.1:3000"
 ```
@@ -152,6 +165,37 @@ WhatsApp replies are sent through the Meta Graph API endpoint:
 ```text
 https://graph.facebook.com/v23.0/{WHATSAPP_PHONE_NUMBER_ID}/messages
 ```
+
+## Google Calendar Setup
+
+Create or reuse a Google Cloud OAuth client with the Google Calendar API enabled.
+Generate a refresh token for the account whose calendars should appear, granting
+only the `https://www.googleapis.com/auth/calendar.readonly` scope. With the
+OAuth client ID and secret exported, this helper opens the default browser for
+approval and prints the refresh token to stdout:
+
+```sh
+GOOGLE_CALENDAR_CLIENT_ID="replace-with-google-oauth-client-id" \
+GOOGLE_CALENDAR_CLIENT_SECRET="replace-with-google-oauth-client-secret" \
+  scripts/get-google-calendar-refresh-token.py
+```
+
+As a one-liner:
+
+```sh
+GOOGLE_CALENDAR_CLIENT_ID="replace-with-google-oauth-client-id" GOOGLE_CALENDAR_CLIENT_SECRET="replace-with-google-oauth-client-secret" scripts/get-google-calendar-refresh-token.py
+```
+
+Provide the OAuth client ID, client secret, and printed refresh token with the
+required Google environment variables above.
+
+The display uses the authenticated user's selected, non-hidden calendars from
+Google Calendar. It determines today from the primary calendar's timezone,
+expands recurring events, and renders the right pane with an `Events - MON DD` header.
+All-day events appear before timed events as `ALL DAY EVENT_TITLE`; timed events
+appear in chronological 24-hour local form such as `09:30 EVENT_TITLE`. If a
+Google token refresh or Calendar API call fails at refresh time, the list still
+renders and the event pane shows `Events unavailable`.
 
 ## Telegram Setup
 
@@ -299,25 +343,37 @@ TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token" \
 
 Set `DEVICE_ID` to override the default `test-device` ID header.
 
-## Local TRMNL Image Preview
+## TRMNL Image Preview
 
-With the server running locally, fetch the rendered PNG and open it with `mpv`:
+With the server running locally, fetch the rendered PNG from the local server and
+open it with `mpv`:
 
 ```sh
 TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token" \
-  scripts/preview-trmnl-image.sh
+  scripts/preview-trmnl-image-local.sh
 ```
 
-The script defaults to `http://127.0.0.1:3000`, fetches `/api/display` with a
-sample `Battery-Voltage: 4.12` header, downloads the returned `image_url`, and
+The local script defaults to `http://127.0.0.1:3000`, fetches `/api/display`
+there, rewrites the returned image path back to the same local base URL, and
 saves `trmnl-list.png`. Override these as needed:
 
 ```sh
 TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token" \
+LOCAL_BASE_URL="http://127.0.0.1:3000" \
 DEVICE_ID="test-device" \
 BATTERY_VOLTAGE="3.85" \
 OUTPUT="preview.png" \
-  scripts/preview-trmnl-image.sh http://127.0.0.1:3000
+  scripts/preview-trmnl-image-local.sh
+```
+
+To preview exactly what the deployed `PUBLIC_BASE_URL` returns, use the public
+script. It fetches `/api/display` from `PUBLIC_BASE_URL` and downloads the
+returned `image_url` as-is:
+
+```sh
+TRMNL_TOKEN="replace-with-operator-chosen-trmnl-token" \
+PUBLIC_BASE_URL="https://HOST" \
+  scripts/preview-trmnl-image-public.sh
 ```
 
 ## Check
@@ -354,6 +410,7 @@ RUSTC_WRAPPER= cargo nextest run
 - `GET /api/display`: requires TRMNL firmware `ID` and `Access-Token` headers
   and returns display JSON whose image URL points at `/trmnl/list.png`.
 - `GET /trmnl/list.png`: requires TRMNL firmware `ID` and `Access-Token`
-  headers and renders the current list as an 800x480 PNG.
+  headers and renders the current list and today's Google Calendar events as an
+  800x480 PNG.
 - `POST /api/log`: requires TRMNL firmware `ID` and `Access-Token` headers,
   accepts empty bodies or valid JSON telemetry, and rejects invalid JSON.

@@ -8,6 +8,9 @@ pub const WEBHOOK_KEY: &str = "WEBHOOK_KEY";
 pub const WHATSAPP_ACCESS_TOKEN: &str = "WHATSAPP_ACCESS_TOKEN";
 pub const WHATSAPP_PHONE_NUMBER_ID: &str = "WHATSAPP_PHONE_NUMBER_ID";
 pub const TELEGRAM_BOT_TOKEN: &str = "TELEGRAM_BOT_TOKEN";
+pub const GOOGLE_CALENDAR_CLIENT_ID: &str = "GOOGLE_CALENDAR_CLIENT_ID";
+pub const GOOGLE_CALENDAR_CLIENT_SECRET: &str = "GOOGLE_CALENDAR_CLIENT_SECRET";
+pub const GOOGLE_CALENDAR_REFRESH_TOKEN: &str = "GOOGLE_CALENDAR_REFRESH_TOKEN";
 pub const CHAT_AUTH_KEY: &str = "CHAT_AUTH_KEY";
 const TRMNL_TOKEN: &str = "TRMNL_TOKEN";
 const PUBLIC_BASE_URL: &str = "PUBLIC_BASE_URL";
@@ -22,6 +25,7 @@ pub struct AppConfig {
     pub webhook_key: SecretString,
     pub chat_auth_key: Option<SecretString>,
     pub messaging_provider: MessagingProviderConfig,
+    pub google_calendar: GoogleCalendarConfig,
     pub trmnl: TrmnlConfig,
     pub public_base_url: String,
     pub database_path: PathBuf,
@@ -60,6 +64,13 @@ pub struct TelegramConfig {
 }
 
 #[derive(Clone)]
+pub struct GoogleCalendarConfig {
+    pub client_id: String,
+    pub client_secret: SecretString,
+    pub refresh_token: SecretString,
+}
+
+#[derive(Clone)]
 pub struct TrmnlConfig {
     pub token: SecretString,
 }
@@ -92,6 +103,7 @@ impl fmt::Debug for AppConfig {
             .field("webhook_key", &self.webhook_key)
             .field("chat_auth_key", &self.chat_auth_key)
             .field("messaging_provider", &self.messaging_provider)
+            .field("google_calendar", &self.google_calendar)
             .field("trmnl", &self.trmnl)
             .field("public_base_url", &self.public_base_url)
             .field("database_path", &self.database_path)
@@ -135,6 +147,17 @@ impl fmt::Debug for TelegramConfig {
         formatter
             .debug_struct("TelegramConfig")
             .field("bot_token", &self.bot_token)
+            .finish()
+    }
+}
+
+impl fmt::Debug for GoogleCalendarConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GoogleCalendarConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &self.client_secret)
+            .field("refresh_token", &self.refresh_token)
             .finish()
     }
 }
@@ -202,6 +225,7 @@ impl AppConfig {
             webhook_key: SecretString(source.required(WEBHOOK_KEY)?),
             chat_auth_key: source.optional(CHAT_AUTH_KEY)?.map(SecretString),
             messaging_provider: messaging_provider_from_source(&source)?,
+            google_calendar: google_calendar_from_source(&source)?,
             trmnl: TrmnlConfig {
                 token: SecretString(source.required(TRMNL_TOKEN)?),
             },
@@ -216,6 +240,14 @@ impl AppConfig {
                 .unwrap_or(DEFAULT_BIND_ADDR.to_owned()),
         })
     }
+}
+
+fn google_calendar_from_source(source: &EnvSource) -> Result<GoogleCalendarConfig, ConfigError> {
+    Ok(GoogleCalendarConfig {
+        client_id: source.required(GOOGLE_CALENDAR_CLIENT_ID)?,
+        client_secret: SecretString(source.required(GOOGLE_CALENDAR_CLIENT_SECRET)?),
+        refresh_token: SecretString(source.required(GOOGLE_CALENDAR_REFRESH_TOKEN)?),
+    })
 }
 
 fn messaging_provider_from_source(
@@ -304,6 +336,12 @@ mod tests {
         (PUBLIC_BASE_URL, "https://example.test"),
     ];
 
+    const GOOGLE_ENV: [(&str, &str); 3] = [
+        (GOOGLE_CALENDAR_CLIENT_ID, "google-client-id"),
+        (GOOGLE_CALENDAR_CLIENT_SECRET, "google-client-secret"),
+        (GOOGLE_CALENDAR_REFRESH_TOKEN, "google-refresh-token"),
+    ];
+
     const WHATSAPP_ENV: [(&str, &str); 2] = [
         (WHATSAPP_ACCESS_TOKEN, "access-secret"),
         (WHATSAPP_PHONE_NUMBER_ID, "phone-number"),
@@ -313,8 +351,9 @@ mod tests {
 
     #[test]
     fn loads_whatsapp_required_values_and_defaults() {
-        let config = AppConfig::from_pairs(COMMON_ENV.into_iter().chain(WHATSAPP_ENV))
-            .expect("config should load");
+        let config =
+            AppConfig::from_pairs(COMMON_ENV.into_iter().chain(GOOGLE_ENV).chain(WHATSAPP_ENV))
+                .expect("config should load");
 
         assert_eq!(config.webhook_key.as_str(), "webhook-secret");
         assert_eq!(config.chat_auth_key, None);
@@ -323,6 +362,15 @@ mod tests {
         };
         assert_eq!(whatsapp.access_token.as_str(), "access-secret");
         assert_eq!(whatsapp.phone_number_id, "phone-number");
+        assert_eq!(config.google_calendar.client_id, "google-client-id");
+        assert_eq!(
+            config.google_calendar.client_secret.as_str(),
+            "google-client-secret"
+        );
+        assert_eq!(
+            config.google_calendar.refresh_token.as_str(),
+            "google-refresh-token"
+        );
         assert_eq!(config.trmnl.token.as_str(), "trmnl-secret");
         assert_eq!(config.public_base_url, "https://example.test");
         assert_eq!(config.database_path, PathBuf::from(DEFAULT_DATABASE_PATH));
@@ -331,8 +379,9 @@ mod tests {
 
     #[test]
     fn loads_telegram_required_values() {
-        let config = AppConfig::from_pairs(COMMON_ENV.into_iter().chain(TELEGRAM_ENV))
-            .expect("config should load");
+        let config =
+            AppConfig::from_pairs(COMMON_ENV.into_iter().chain(GOOGLE_ENV).chain(TELEGRAM_ENV))
+                .expect("config should load");
 
         let MessagingProviderConfig::Telegram(telegram) = config.messaging_provider else {
             panic!("Telegram config should load");
@@ -342,11 +391,17 @@ mod tests {
 
     #[test]
     fn optional_values_override_defaults() {
-        let config = AppConfig::from_pairs(COMMON_ENV.into_iter().chain(WHATSAPP_ENV).chain([
-            (DATABASE_PATH, "/tmp/list.db"),
-            (BIND_ADDR, "0.0.0.0:8080"),
-            (CHAT_AUTH_KEY, "chat-secret"),
-        ]))
+        let config = AppConfig::from_pairs(
+            COMMON_ENV
+                .into_iter()
+                .chain(GOOGLE_ENV)
+                .chain(WHATSAPP_ENV)
+                .chain([
+                    (DATABASE_PATH, "/tmp/list.db"),
+                    (BIND_ADDR, "0.0.0.0:8080"),
+                    (CHAT_AUTH_KEY, "chat-secret"),
+                ]),
+        )
         .expect("config should load");
 
         assert_eq!(config.database_path, PathBuf::from("/tmp/list.db"));
@@ -359,7 +414,7 @@ mod tests {
 
     #[test]
     fn missing_common_required_values_name_the_variable() {
-        let error = AppConfig::from_pairs(WHATSAPP_ENV).unwrap_err();
+        let error = AppConfig::from_pairs(WHATSAPP_ENV.into_iter().chain(GOOGLE_ENV)).unwrap_err();
 
         assert_eq!(
             error,
@@ -371,8 +426,20 @@ mod tests {
     }
 
     #[test]
+    fn missing_google_calendar_value_names_the_variable() {
+        let error = AppConfig::from_pairs(COMMON_ENV.into_iter().chain(WHATSAPP_ENV)).unwrap_err();
+
+        assert_eq!(
+            error,
+            ConfigError::MissingRequiredVariable {
+                variable: GOOGLE_CALENDAR_CLIENT_ID
+            }
+        );
+    }
+
+    #[test]
     fn missing_provider_group_fails() {
-        let error = AppConfig::from_pairs(COMMON_ENV).unwrap_err();
+        let error = AppConfig::from_pairs(COMMON_ENV.into_iter().chain(GOOGLE_ENV)).unwrap_err();
 
         assert_eq!(error, ConfigError::MissingMessagingProvider);
     }
@@ -382,6 +449,7 @@ mod tests {
         let config = AppConfig::from_pairs(
             COMMON_ENV
                 .into_iter()
+                .chain(GOOGLE_ENV)
                 .chain(WHATSAPP_ENV)
                 .chain(TELEGRAM_ENV),
         )
@@ -400,6 +468,7 @@ mod tests {
         let config = AppConfig::from_pairs(
             COMMON_ENV
                 .into_iter()
+                .chain(GOOGLE_ENV)
                 .chain([(WHATSAPP_ACCESS_TOKEN, "access-secret")])
                 .chain(TELEGRAM_ENV),
         )
@@ -416,6 +485,7 @@ mod tests {
         let error = AppConfig::from_pairs(
             COMMON_ENV
                 .into_iter()
+                .chain(GOOGLE_ENV)
                 .chain([(WHATSAPP_ACCESS_TOKEN, "access-secret")]),
         )
         .unwrap_err();
@@ -433,6 +503,7 @@ mod tests {
         let error = AppConfig::from_pairs(
             COMMON_ENV
                 .into_iter()
+                .chain(GOOGLE_ENV)
                 .chain([("WHATSAPP_VERIFY_TOKEN", "old-secret")]),
         )
         .unwrap_err();
@@ -442,16 +513,20 @@ mod tests {
 
     #[test]
     fn secrets_are_redacted_in_debug_output() {
-        let config = AppConfig::from_pairs(COMMON_ENV.into_iter().chain(WHATSAPP_ENV))
-            .expect("config should load");
+        let config =
+            AppConfig::from_pairs(COMMON_ENV.into_iter().chain(GOOGLE_ENV).chain(WHATSAPP_ENV))
+                .expect("config should load");
 
         assert_eq!(format!("{:?}", config.webhook_key), "[redacted]");
         assert!(!format!("{config:?}").contains("webhook-secret"));
         assert!(!format!("{config:?}").contains("access-secret"));
+        assert!(!format!("{config:?}").contains("google-client-secret"));
+        assert!(!format!("{config:?}").contains("google-refresh-token"));
 
         let config = AppConfig::from_pairs(
             COMMON_ENV
                 .into_iter()
+                .chain(GOOGLE_ENV)
                 .chain(WHATSAPP_ENV)
                 .chain([(CHAT_AUTH_KEY, "chat-secret")]),
         )
